@@ -1,8 +1,9 @@
 name: CI
 
-# Runs only before a release (release.yml calls it for v* tags) or by hand
-# (Actions → CI → Run workflow). Everyday pushes are tested locally.
+# Runs on every pull request (main is protected: changes land through one),
+# before a release (release.yml calls it for v* tags), or by hand.
 on:
+  pull_request:
   workflow_call:
   workflow_dispatch:
 
