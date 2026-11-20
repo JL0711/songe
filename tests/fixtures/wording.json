@@ -1,0 +1,1286 @@
+{
+  "statuses": [
+    {
+      "name": "examples beyond configured training capacity",
+      "data": {
+        "activity": {
+          "now": "waiting · examples exceed training size · recorded examples need a larger training size"
+        }
+      },
+      "copy": [
+        "Collecting",
+        "Some examples too long to train"
+      ]
+    },
+    {
+      "name": "untrained examples after undersized scoring",
+      "data": {
+        "activity": {
+          "now": "waiting · preparing examples · 445 examples waiting to learn"
+        }
+      },
+      "copy": [
+        "Preparing training data",
+        "445 to prepare"
+      ]
+    },
+    {
+      "name": "paused",
+      "data": {
+        "activity": {
+          "now": "training Qwen",
+          "next": "resume → train Qwen3.5-4B"
+        },
+        "paused": true
+      },
+      "copy": [
+        "Paused",
+        "Turn Learning on to continue"
+      ],
+      "next": "Turn learning on, then train Qwen3.5-4B"
+    },
+    {
+      "name": "stopped",
+      "data": {
+        "activity": {
+          "now": "waiting · service stopped · songe serve",
+          "next": "songe serve → resume scheduler"
+        }
+      },
+      "copy": [
+        "Songe is stopped",
+        "Run songe serve"
+      ],
+      "next": "Run songe serve in your terminal."
+    },
+    {
+      "name": "first model",
+      "data": {
+        "activity": {
+          "now": "waiting · no models · songe init",
+          "next": "songe init → connect a model"
+        }
+      },
+      "copy": [
+        "Connect a model",
+        "Run songe init"
+      ],
+      "next": "Run songe init in your terminal."
+    },
+    {
+      "name": "all off",
+      "data": {
+        "activity": {
+          "now": "waiting · learning off for all models"
+        }
+      },
+      "copy": [
+        "Learning off",
+        "Turn on a model below"
+      ]
+    },
+    {
+      "name": "memory",
+      "data": {
+        "activity": {
+          "now": "waiting · memory · 1.9 GB free, needs 3.2 GB",
+          "next": "train Qwen · when memory frees"
+        }
+      },
+      "copy": [
+        "Waiting for memory",
+        "1.9 GB free, needs 3.2 GB · retries automatically"
+      ],
+      "next": "Train Qwen · when memory frees"
+    },
+    {
+      "name": "power",
+      "data": {
+        "activity": {
+          "now": "waiting · battery 8%"
+        }
+      },
+      "copy": [
+        "Waiting for power",
+        "Battery 8% · plug in to continue"
+      ]
+    },
+    {
+      "name": "cooling",
+      "data": {
+        "activity": {
+          "now": "waiting · machine temperature too high"
+        }
+      },
+      "copy": [
+        "Waiting to cool down",
+        "Retries automatically"
+      ]
+    },
+    {
+      "name": "training conversations",
+      "data": {
+        "activity": {
+          "now": "waiting · collecting conversations · 20 of 32"
+        }
+      },
+      "copy": [
+        "Collecting",
+        "20/32 examples"
+      ]
+    },
+    {
+      "name": "checking conversations",
+      "data": {
+        "activity": {
+          "now": "waiting · collecting conversations · 3 of 12 needed to check updates"
+        }
+      },
+      "copy": [
+        "Collecting",
+        "3/12 conversations"
+      ]
+    },
+    {
+      "name": "new conversations",
+      "data": {
+        "activity": {
+          "now": "waiting · collecting conversations · 2 of 8 new examples"
+        }
+      },
+      "copy": [
+        "Collecting",
+        "2/8 new examples"
+      ]
+    },
+    {
+      "name": "old service",
+      "data": {
+        "activity": {
+          "now": "waiting · learnable experience · train 20/32 · held-out 3/12"
+        }
+      },
+      "copy": [
+        "Collecting",
+        "20/32 training examples · 3/12 test examples"
+      ]
+    },
+    {
+      "name": "no conversations",
+      "data": {
+        "activity": {
+          "now": "waiting · no new conversations through songe yet"
+        }
+      },
+      "copy": [
+        "Collecting",
+        "Use your agent through Songe"
+      ]
+    },
+    {
+      "name": "quiet",
+      "data": {
+        "activity": {
+          "now": "waiting · proxy idle 8m/10m",
+          "next": "idle 8m/10m → train Qwen"
+        }
+      },
+      "copy": [
+        "Ready to train",
+        "Starts when idle · 8m of 10m"
+      ],
+      "next": "Train Qwen · when idle"
+    },
+    {
+      "name": "in use",
+      "data": {
+        "activity": {
+          "now": "waiting · proxy requests in flight"
+        }
+      },
+      "copy": [
+        "In use",
+        "Continues after this conversation"
+      ]
+    },
+    {
+      "name": "ready update",
+      "data": {
+        "activity": {
+          "now": "waiting · checks passed · swap pending"
+        }
+      },
+      "copy": [
+        "Update ready",
+        "Applies when idle"
+      ]
+    },
+    {
+      "name": "failure",
+      "data": {
+        "activity": {
+          "now": "waiting · worker failed"
+        }
+      },
+      "copy": [
+        "Needs attention",
+        "worker failed · run songe doctor"
+      ]
+    },
+    {
+      "name": "training",
+      "data": {
+        "activity": {
+          "now": "training Qwen · step 41/120 · ~3m left"
+        }
+      },
+      "copy": [
+        "Training Qwen",
+        "Step 41 of 120 · About 3m left"
+      ]
+    },
+    {
+      "name": "measuring",
+      "data": {
+        "activity": {
+          "now": "calibrating Qwen · 2/4"
+        }
+      },
+      "copy": [
+        "Measuring training needs for Qwen",
+        "2/4"
+      ]
+    },
+    {
+      "name": "preparing",
+      "data": {
+        "activity": {
+          "now": "fusing Qwen"
+        }
+      },
+      "copy": [
+        "Preparing the update for Qwen",
+        ""
+      ]
+    },
+    {
+      "name": "applying",
+      "data": {
+        "activity": {
+          "now": "swapping Qwen"
+        }
+      },
+      "copy": [
+        "Applying the update to Qwen",
+        ""
+      ]
+    },
+    {
+      "name": "partial calibration active",
+      "data": {
+        "activity": {
+          "now": "measuring training size · 44 of ~900 tokens",
+          "phase": "calibrate"
+        }
+      },
+      "copy": [
+        "Measuring",
+        "What this machine can train · 44 of 900 tokens · first time only"
+      ]
+    },
+    {
+      "name": "partial calibration waiting",
+      "data": {
+        "activity": {
+          "now": "waiting · measuring training size · 44 of ~900 tokens",
+          "next": "idle 8m/10m → calibrate Qwen"
+        }
+      },
+      "copy": [
+        "Ready to measure",
+        "44 of 900 tokens · starts when idle"
+      ],
+      "next": "Measure training needs for Qwen · when idle"
+    },
+    {
+      "name": "error backoff",
+      "data": {
+        "activity": {
+          "now": "waiting · error · retry in 2h",
+          "next": "train Qwen · in 2h"
+        }
+      },
+      "copy": [
+        "Retrying after an error",
+        "Retries in 2h · run songe doctor"
+      ],
+      "next": "Train Qwen · in 2h"
+    },
+    {
+      "name": "measurement required",
+      "data": {
+        "activity": {
+          "now": "waiting · calibration required",
+          "next": "idle 1m/10m → calibrate Qwen"
+        }
+      },
+      "copy": [
+        "Ready to measure",
+        "Starts when idle"
+      ],
+      "next": "Measure training needs for Qwen · when idle"
+    },
+    {
+      "name": "measurement recorded, phase idle",
+      "data": {
+        "activity": {
+          "now": "measuring training size · 44 of ~900 tokens"
+        }
+      },
+      "copy": [
+        "Ready to measure",
+        "44 of 900 tokens · starts when idle"
+      ]
+    },
+    {
+      "name": "only model unsupported",
+      "data": {
+        "activity": {
+          "now": "waiting · unsupported · Gemma 3",
+          "next": "choose another model"
+        }
+      },
+      "copy": [
+        "Not supported yet",
+        "Gemma 3 · Choose another model"
+      ],
+      "next": "Choose another model"
+    },
+    {
+      "name": "collecting with examples too long",
+      "data": {
+        "activity": {
+          "now": "waiting · collecting conversations · 0 of 8 new examples · some too long to train",
+          "next": "train Qwen · needs more data"
+        }
+      },
+      "copy": [
+        "Collecting",
+        "0/8 new examples · some too long to train"
+      ],
+      "next": "Train Qwen · after more conversations"
+    },
+    {
+      "name": "measuring finishes without data",
+      "data": {
+        "activity": {
+          "now": "measuring training size · 44 of ~900 tokens",
+          "phase": "calibrate",
+          "next": "Use your agent through Songe · Qwen learns from conversations"
+        }
+      },
+      "copy": [
+        "Measuring",
+        "What this machine can train · 44 of 900 tokens · first time only"
+      ],
+      "next": "Use your agent through Songe · Qwen learns from conversations"
+    },
+    {
+      "name": "restoring an older version",
+      "data": {
+        "activity": {"now": "waiting · retry delay after previous work slice"},
+        "restoring": {"version": "night-3", "model": "Qwen3.5-4B", "fraction": 0.42}
+      },
+      "copy": [
+        "Restoring",
+        "Qwen3.5-4B · v3 · 42%"
+      ]
+    },
+    {
+      "name": "measuring a longer teacher context",
+      "data": {
+        "activity": {
+          "now": "measuring training size · 7212 of ~13673 tokens · longer contexts",
+          "phase": "calibrate"
+        }
+      },
+      "copy": [
+        "Measuring",
+        "What this machine can train · 7212 of 13673 tokens · longer contexts"
+      ]
+    },
+    {
+      "name": "model server closed",
+      "data": {
+        "activity": {
+          "now": "waiting · the model server: ConnectError: All connection attempts failed pending",
+          "next": "idle 0s/10s → train Qwen"
+        }
+      },
+      "copy": [
+        "Model server not running",
+        "Start it · retries automatically"
+      ],
+      "next": "Train Qwen · when idle"
+    },
+    {
+      "name": "tick failed",
+      "data": {
+        "activity": {
+          "now": "waiting · Sleep failed · serving retained",
+          "next": "idle 0s/10s → train Qwen"
+        }
+      },
+      "copy": [
+        "Retrying after an error",
+        "Current version kept · run songe doctor"
+      ],
+      "next": "Train Qwen · when idle"
+    },
+    {
+      "name": "stopping",
+      "data": {
+        "activity": {
+          "now": "waiting · pausing · model in use",
+          "next": "train Qwen · continues when idle"
+        }
+      },
+      "copy": [
+        "Pausing",
+        "Model in use · saving progress"
+      ],
+      "next": "Train Qwen · continues when idle"
+    }
+  ],
+  "models": [
+    {
+      "name": "empty",
+      "model": {
+        "id": "qwen",
+        "learning_level": "new"
+      },
+      "pipeline": {},
+      "snapshot": {},
+      "summary": [
+        "No conversations yet",
+        "use your agent through Songe"
+      ]
+    },
+    {
+      "name": "off",
+      "model": {
+        "id": "qwen",
+        "learning_level": "off"
+      },
+      "pipeline": {},
+      "snapshot": {},
+      "summary": [
+        "",
+        ""
+      ]
+    },
+    {
+      "name": "embedding",
+      "model": {
+        "id": "qwen",
+        "learning_level": "new",
+        "support": "unsupported",
+        "reason": "embedding model"
+      },
+      "pipeline": {},
+      "snapshot": {},
+      "summary": [
+        "Not supported yet",
+        "Embedding model"
+      ]
+    },
+    {
+      "name": "format",
+      "model": {
+        "id": "qwen",
+        "learning_level": "new",
+        "support": "unsupported",
+        "reason": "adapter format unavailable"
+      },
+      "pipeline": {},
+      "snapshot": {},
+      "summary": [
+        "Not supported yet",
+        "adapter format unavailable"
+      ]
+    },
+    {
+      "name": "files",
+      "model": {
+        "id": "qwen",
+        "learning_level": "new",
+        "support": "unsupported",
+        "reason": "weights not accessible"
+      },
+      "pipeline": {},
+      "snapshot": {},
+      "summary": [
+        "Not supported yet",
+        "weights not accessible"
+      ]
+    },
+    {
+      "name": "large",
+      "model": {
+        "id": "qwen",
+        "learning_level": "new",
+        "support": "unsupported",
+        "reason": "too large"
+      },
+      "pipeline": {},
+      "snapshot": {},
+      "summary": [
+        "Not supported yet",
+        "too large"
+      ]
+    },
+    {
+      "name": "unknown support",
+      "model": {
+        "id": "qwen",
+        "learning_level": "new",
+        "support": "unsupported",
+        "reason": "Learning is unavailable"
+      },
+      "pipeline": {},
+      "snapshot": {},
+      "summary": [
+        "Not supported yet",
+        "Learning is unavailable"
+      ]
+    },
+    {
+      "name": "memory",
+      "model": {
+        "id": "qwen",
+        "learning_level": "new",
+        "reason": "calibration paused · memory · retry when idle"
+      },
+      "pipeline": {},
+      "snapshot": {},
+      "summary": [
+        "Waiting for memory",
+        "retries automatically"
+      ]
+    },
+    {
+      "name": "memory while in use",
+      "model": {
+        "id": "qwen",
+        "learning_level": "new",
+        "reason": "calibration paused · memory · retry when idle"
+      },
+      "pipeline": {},
+      "snapshot": {
+        "activity": {
+          "now": "waiting: proxy requests in flight"
+        }
+      },
+      "summary": [
+        "In use",
+        "continues after this conversation"
+      ]
+    },
+    {
+      "name": "file memory",
+      "model": {
+        "id": "qwen",
+        "learning_level": "new",
+        "files": [
+          {
+            "id": "gguf",
+            "reason": "needs 8 GB"
+          }
+        ]
+      },
+      "pipeline": {},
+      "snapshot": {},
+      "summary": [
+        "Waiting for memory",
+        "retries automatically"
+      ]
+    },
+    {
+      "name": "failure",
+      "model": {
+        "id": "qwen",
+        "learning_level": "new",
+        "reason": "training failed"
+      },
+      "pipeline": {},
+      "snapshot": {},
+      "summary": [
+        "Needs attention",
+        "open for the fix"
+      ]
+    },
+    {
+      "name": "recorded",
+      "model": {
+        "id": "qwen",
+        "learning_level": "new"
+      },
+      "pipeline": {
+        "day": {
+          "conversations": 2
+        }
+      },
+      "snapshot": {},
+      "summary": [
+        "Collecting",
+        "2 conversations"
+      ]
+    },
+    {
+      "name": "lesson",
+      "model": {
+        "id": "qwen",
+        "learning_level": "new"
+      },
+      "pipeline": {
+        "rewind": {
+          "lessons": 1
+        }
+      },
+      "snapshot": {},
+      "summary": [
+        "Collecting",
+        "1 lesson found"
+      ]
+    },
+    {
+      "name": "updated unknown",
+      "model": {
+        "id": "qwen",
+        "learning_level": "new"
+      },
+      "pipeline": {
+        "wake": {
+          "last": {
+            "swapped": true,
+            "repeat_errors_delta": null
+          }
+        }
+      },
+      "snapshot": {},
+      "summary": [
+        "Updated",
+        "passed checks"
+      ]
+    },
+    {
+      "name": "previous",
+      "model": {
+        "id": "qwen",
+        "learning_level": "new"
+      },
+      "pipeline": {
+        "wake": {
+          "last": {
+            "swapped": false
+          }
+        }
+      },
+      "snapshot": {},
+      "summary": [
+        "Kept previous version",
+        "update did not pass checks"
+      ]
+    },
+    {
+      "name": "absolute down",
+      "model": {
+        "id": "qwen",
+        "learning_level": "new"
+      },
+      "pipeline": {
+        "wake": {
+          "last": {
+            "repeat_errors_delta": -0.18,
+            "swapped": true
+          }
+        }
+      },
+      "snapshot": {},
+      "summary": [
+        "Repeat-error rate down 18 percentage points",
+        "Measured during everyday use."
+      ]
+    },
+    {
+      "name": "absolute up",
+      "model": {
+        "id": "qwen",
+        "learning_level": "new"
+      },
+      "pipeline": {
+        "wake": {
+          "last": {
+            "repeat_errors_delta": 0.01
+          }
+        }
+      },
+      "snapshot": {},
+      "summary": [
+        "Repeat-error rate up 1 percentage point",
+        "Measured during everyday use."
+      ]
+    },
+    {
+      "name": "tiny",
+      "model": {
+        "id": "qwen",
+        "learning_level": "new"
+      },
+      "pipeline": {
+        "wake": {
+          "last": {
+            "repeat_errors_delta": -1e-05
+          }
+        }
+      },
+      "snapshot": {},
+      "summary": [
+        "Repeat-error rate down <0.1 percentage points",
+        "Measured during everyday use."
+      ]
+    },
+    {
+      "name": "zero",
+      "model": {
+        "id": "qwen",
+        "learning_level": "new"
+      },
+      "pipeline": {
+        "wake": {
+          "last": {
+            "repeat_errors_delta": 0
+          }
+        }
+      },
+      "snapshot": {},
+      "summary": [
+        "No change in repeat errors",
+        "Measured during everyday use."
+      ]
+    },
+    {
+      "name": "relative",
+      "model": {
+        "id": "qwen",
+        "learning_level": "new",
+        "learning": {
+          "conversations": 2,
+          "last": {
+            "repeat_errors_change": -0.18,
+            "status": "swapped"
+          }
+        }
+      },
+      "pipeline": {},
+      "snapshot": {},
+      "summary": [
+        "18% fewer repeat errors",
+        "2 conversations"
+      ]
+    },
+    {
+      "name": "absolute overrides relative",
+      "model": {
+        "id": "qwen",
+        "learning_level": "new",
+        "learning": {
+          "last": {
+            "repeat_errors_change": -0.18
+          }
+        }
+      },
+      "pipeline": {
+        "wake": {
+          "last": {
+            "repeat_errors_delta": 0.03
+          }
+        }
+      },
+      "snapshot": {},
+      "summary": [
+        "Repeat-error rate up 3 percentage points",
+        "Measured during everyday use."
+      ]
+    },
+    {
+      "name": "null overrides relative",
+      "model": {
+        "id": "qwen",
+        "learning_level": "new",
+        "learning": {
+          "last": {
+            "repeat_errors_change": -0.18
+          }
+        }
+      },
+      "pipeline": {
+        "wake": {
+          "last": {
+            "repeat_errors_delta": null,
+            "swapped": true
+          }
+        }
+      },
+      "snapshot": {},
+      "summary": [
+        "Updated",
+        "passed checks"
+      ]
+    },
+    {
+      "name": "working",
+      "model": {
+        "id": "qwen",
+        "learning_level": "new",
+        "files": [
+          {
+            "id": "gguf"
+          }
+        ]
+      },
+      "pipeline": {},
+      "snapshot": {
+        "activity": {
+          "phase": "train",
+          "model": "gguf",
+          "training": true
+        }
+      },
+      "summary": [
+        "Training",
+        ""
+      ]
+    },
+    {
+      "name": "measuring",
+      "model": {
+        "id": "qwen",
+        "learning_level": "new"
+      },
+      "pipeline": {},
+      "snapshot": {
+        "activity": {
+          "phase": "calibrate",
+          "model": "qwen"
+        }
+      },
+      "summary": [
+        "Measuring",
+        ""
+      ]
+    },
+    {
+      "name": "paused work",
+      "model": {
+        "id": "qwen",
+        "learning_level": "new"
+      },
+      "pipeline": {},
+      "snapshot": {
+        "paused": true,
+        "activity": {
+          "phase": "train",
+          "model": "qwen",
+          "training": true
+        }
+      },
+      "summary": [
+        "No conversations yet",
+        "use your agent through Songe"
+      ]
+    },
+    {
+      "name": "other work",
+      "model": {
+        "id": "qwen",
+        "learning_level": "new"
+      },
+      "pipeline": {},
+      "snapshot": {
+        "activity": {
+          "phase": "train",
+          "model": "other",
+          "training": true
+        }
+      },
+      "summary": [
+        "No conversations yet",
+        "use your agent through Songe"
+      ]
+    },
+    {
+      "name": "working keeps result",
+      "model": {
+        "id": "qwen",
+        "learning_level": "new"
+      },
+      "pipeline": {
+        "wake": {
+          "last": {
+            "repeat_errors_delta": 0
+          }
+        }
+      },
+      "snapshot": {
+        "activity": {
+          "phase": "train",
+          "model": "qwen",
+          "training": true
+        }
+      },
+      "summary": [
+        "No change in repeat errors",
+        "Measured during everyday use."
+      ]
+    },
+    {
+      "name": "full stage rows",
+      "model": {
+        "id": "qwen",
+        "learning_level": "new"
+      },
+      "snapshot": {},
+      "pipeline": {
+        "day": {
+          "conversations": 38,
+          "steps": 112,
+          "heldout": 12
+        },
+        "rewind": {
+          "lessons": 6,
+          "signals": {
+            "tool_error_fixed": 5,
+            "user_correction": 4,
+            "retry_success": 3,
+            "loop": 2,
+            "static_invalid": 1,
+            "tool_error": 0
+          }
+        },
+        "consolidate": {
+          "runs": 3,
+          "step": 41,
+          "total": 120,
+          "eta_seconds": 180,
+          "last_seconds": 95
+        },
+        "wake": {
+          "last": {
+            "repeat_errors_delta": -0.18,
+            "swapped": true
+          }
+        }
+      },
+      "summary": [
+        "Repeat-error rate down 18 percentage points",
+        "38 conversations · 6 lessons found"
+      ]
+    },
+    {
+      "name": "live stage progress",
+      "model": {
+        "id": "qwen",
+        "learning_level": "new",
+        "files": [
+          {
+            "id": "gguf"
+          }
+        ]
+      },
+      "pipeline": {},
+      "snapshot": {
+        "activity": {
+          "model": "gguf",
+          "phase": "train",
+          "training": true
+        },
+        "training": {
+          "model": "gguf",
+          "phase": "train",
+          "step": 42,
+          "total_steps": 120,
+          "data_progress": {
+            "eta_seconds": 160
+          }
+        }
+      },
+      "summary": [
+        "Training",
+        ""
+      ]
+    },
+    {
+      "name": "authoritative pipeline",
+      "model": {
+        "id": "qwen",
+        "learning_level": "new"
+      },
+      "pipeline": {
+        "day": {
+          "conversations": 4
+        }
+      },
+      "snapshot": {
+        "pipeline": {
+          "qwen": {
+            "day": {
+              "conversations": 8
+            }
+          }
+        }
+      },
+      "summary": [
+        "Collecting",
+        "8 conversations"
+      ]
+    },
+    {
+      "name": "pause between work slices",
+      "model": {"id": "qwen", "learning_level": "all"},
+      "pipeline": {},
+      "snapshot": {"activity": {"now": "waiting · retry delay after previous work slice", "next": "train qwen", "model": "qwen"}},
+      "summary": ["Training", ""]
+    },
+    {
+      "name": "checking",
+      "model": {
+        "id": "qwen",
+        "learning_level": "new"
+      },
+      "pipeline": {},
+      "snapshot": {
+        "activity": {
+          "now": "checking Qwen",
+          "phase": "gate",
+          "model": "qwen"
+        }
+      },
+      "summary": [
+        "Checking",
+        ""
+      ]
+    },
+    {
+      "name": "preparing update",
+      "model": {
+        "id": "qwen",
+        "learning_level": "new"
+      },
+      "pipeline": {},
+      "snapshot": {
+        "activity": {
+          "now": "fusing Qwen",
+          "phase": "fuse",
+          "model": "qwen"
+        }
+      },
+      "summary": [
+        "Preparing update",
+        ""
+      ]
+    },
+    {
+      "name": "applying update",
+      "model": {
+        "id": "qwen",
+        "learning_level": "new"
+      },
+      "pipeline": {},
+      "snapshot": {
+        "activity": {
+          "now": "swapping Qwen",
+          "phase": "swap",
+          "model": "qwen"
+        }
+      },
+      "summary": [
+        "Applying update",
+        ""
+      ]
+    },
+    {
+      "name": "ready to measure",
+      "model": {
+        "id": "qwen",
+        "learning_level": "new",
+        "support": "pending"
+      },
+      "pipeline": {},
+      "snapshot": {
+        "activity": {
+          "now": "waiting · measuring training size · 44 of ~900 tokens",
+          "model": "qwen"
+        }
+      },
+      "summary": [
+        "Ready to measure",
+        "44 of 900 tokens · starts when idle"
+      ]
+    },
+    {
+      "name": "ready to measure, no candidate",
+      "model": {
+        "id": "qwen",
+        "learning_level": "new",
+        "support": "pending"
+      },
+      "pipeline": {},
+      "snapshot": {
+        "activity": {
+          "now": "waiting · calibration required"
+        }
+      },
+      "summary": [
+        "Ready to measure",
+        "starts when idle"
+      ]
+    },
+    {
+      "name": "measurement for another model",
+      "model": {
+        "id": "qwen",
+        "learning_level": "new",
+        "support": "trainable"
+      },
+      "pipeline": {},
+      "snapshot": {
+        "activity": {
+          "now": "waiting · calibration required",
+          "model": "other"
+        }
+      },
+      "summary": [
+        "No conversations yet",
+        "use your agent through Songe"
+      ]
+    },
+    {
+      "name": "rejected update",
+      "model": {
+        "id": "qwen",
+        "learning_level": "new"
+      },
+      "pipeline": {
+        "wake": {
+          "last": {
+            "at": 1794354000,
+            "swapped": false
+          }
+        },
+        "versions": [
+          {
+            "id": "base",
+            "kind": "base",
+            "current": true
+          }
+        ]
+      },
+      "snapshot": {},
+      "summary": [
+        "Kept previous version",
+        "update did not pass checks"
+      ]
+    },
+    {
+      "name": "versions without new data",
+      "model": {
+        "id": "qwen",
+        "learning_level": "new"
+      },
+      "pipeline": {
+        "versions": [
+          {
+            "id": "v3",
+            "current": true
+          },
+          {
+            "id": "base",
+            "kind": "base",
+            "current": false
+          }
+        ]
+      },
+      "snapshot": {},
+      "summary": [
+        "No conversations yet",
+        "use your agent through Songe"
+      ]
+    },
+    {
+      "name": "off model",
+      "model": {
+        "id": "qwen",
+        "learning_level": "off"
+      },
+      "pipeline": {},
+      "snapshot": {},
+      "summary": [
+        "",
+        ""
+      ]
+    },
+    {
+      "name": "collecting",
+      "model": {
+        "id": "qwen",
+        "learning_level": "new"
+      },
+      "pipeline": {
+        "day": {
+          "conversations": 3
+        },
+        "next": {
+          "stage": "train",
+          "have": 3,
+          "need": 8
+        }
+      },
+      "snapshot": {},
+      "summary": [
+        "Collecting",
+        "3/8 examples"
+      ]
+    }
+  ],
+  "readable": [
+    {
+      "raw": "retry delay after previous work slice",
+      "text": "short pause after the last run"
+    },
+    {
+      "raw": "run next work slice for Qwen",
+      "text": "Continue learning from Qwen"
+    },
+    {
+      "raw": "select model · learning enabled + learnable experience",
+      "text": "Choose New or All for a model, then use your agent through Songe."
+    },
+    {
+      "raw": "swap Qwen · checks pass + no proxy requests",
+      "text": "apply the update to Qwen · after checks pass and no conversations in progress"
+    },
+    {
+      "raw": "resume scheduler · checkpoint saved",
+      "text": "continue learning · progress saved"
+    },
+    {
+      "raw": "resume → train Qwen3.5-4B",
+      "text": "turn learning on, then train Qwen3.5-4B"
+    },
+    {
+      "raw": "resume → calibrate Qwen3.5-4B",
+      "text": "turn learning on, then measure training needs for Qwen3.5-4B"
+    }
+  ]
+}

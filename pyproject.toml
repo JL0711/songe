@@ -1,0 +1,122 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "songe"
+version = "0.1.0a13"
+description = "Local hindsight distillation for a model that sleeps."
+readme = "README.md"
+requires-python = ">=3.11"
+authors = [{ name = "Sous Labs" }]
+license = "Apache-2.0"
+license-files = ["LICENSE"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Operating System :: MacOS",
+    "Operating System :: POSIX :: Linux",
+    "Environment :: Console",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+]
+dependencies = [
+    "packaging>=24.2,<27",
+    "httpx>=0.28,<1",
+    "starlette>=0.49,<2",
+    "uvicorn>=0.38,<1",
+    "textual>=6.12,<7",
+    "rich>=15,<16",
+    # Local libraries may contain GGUF files even on serve-only machines.
+    "gguf>=0.19,<1",
+    "jsonschema>=4.26,<5",
+    # In-process shell AST verification; never invoke a shell to check dreams.
+    # Identify and supervise local model servers, including CPU-only serving.
+    "psutil>=5.9,<8",
+    # compat.py uses the differentiable primitives added in MLX 0.32.4.
+    "mlx>=0.32.4,<0.33; sys_platform == 'darwin' and platform_machine == 'arm64'",
+    "mlx-lm>=0.32,<0.33; sys_platform == 'darwin' and platform_machine == 'arm64'",
+    "lmstudio>=1.5,<2",
+]
+
+[project.optional-dependencies]
+mlx = [
+    "mlx>=0.32.4,<0.33; sys_platform == 'darwin' and platform_machine == 'arm64'",
+    "mlx-lm>=0.32,<0.33; sys_platform == 'darwin' and platform_machine == 'arm64'",
+]
+# GgufConfig(dequantize=True) needs current transformers; the pinned official
+# llama.cpp converter needs torch >= 2.11 and tokenizer codecs.
+torch = [
+    "torch>=2.11,<3",
+    "transformers>=5.22.2,<6",
+    "peft>=0.21,<1",
+    "accelerate>=1,<2",
+    "safetensors>=0.5,<1",
+    "sentencepiece>=0.2,<1",
+    "protobuf>=5,<8",
+]
+# Extras cannot choose a wheel index. See docs/RELEASING.md for accelerator setup.
+cuda = [
+    "songe[torch]",
+    "nvidia-ml-py>=12; sys_platform == 'linux' or sys_platform == 'win32'",
+    "bitsandbytes>=0.45,<1; sys_platform == 'linux' or sys_platform == 'win32'",
+]
+rocm = ["songe[torch]"]
+
+[project.urls]
+Homepage = "https://github.com/sous-labs/songe"
+Repository = "https://github.com/sous-labs/songe"
+Issues = "https://github.com/sous-labs/songe/issues"
+
+[project.scripts]
+songe = "songe.cli:main"
+
+[dependency-groups]
+dev = [
+    # CPU math tests must not rely on MLX's transitive dependencies.
+    "numpy>=1.26,<3",
+    "playwright>=1.57,<2",
+    "pytest>=9,<10",
+    "pytest-asyncio>=1,<2",
+    "pytest-timeout>=2.3,<3",
+    "ruff>=0.14,<1",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/songe"]
+
+[tool.hatch.build.targets.sdist]
+include = [
+    "/src",
+    "/tests",
+    "/.github/ci",
+    "/packaging",
+    "/pyproject.toml",
+    "/uv.lock",
+    "/README.md",
+    "/LICENSE",
+    "/docs/RELEASING.md",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests", "packaging/homebrew"]
+pythonpath = [".github/ci"]
+addopts = ["-ra", "-p", "platform_checks"]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+# A hung test prints every thread's stack instead of stalling CI silently.
+faulthandler_timeout = 300
+# Any single test past two minutes fails with its stack instead of stalling.
+timeout = 120
+
+[tool.ruff]
+target-version = "py311"
+# research/ is a separate private repository checked out inside this one.
+extend-exclude = ["research"]
+
+[tool.ruff.lint]
+preview = true
+explicit-preview-rules = true
+# PLW1514: text I/O must name its encoding (Windows defaults to cp1252).
+select = ["E4", "E7", "E9", "F", "I", "B", "PLW1514"]
+

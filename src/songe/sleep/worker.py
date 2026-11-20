@@ -1,0 +1,1476 @@
+"""Resumable learning units; reads observations and never executes user tools."""
+
+import argparse
+import gc
+import json
+import logging
+import math
+import signal
+import time
+from dataclasses import replace
+from pathlib import Path
+from statistics import mean
+
+from ..artifacts.storage import StorageWait
+from ..backends import Interrupted, choose
+from ..config import Config, data_dir
+from ..log import Store
+from ..platform import Rooted, current, power_status
+from ..platform.locking import acquire
+from ..schedule import (
+    base_fingerprint,
+    probe,
+    rebuild_key,
+    rebuild_pending,
+    rebuild_reason,
+    slice_duration,
+    work_costs,
+)
+from ..schedule import resumable as can_resume
+from ..steps import digest, revision_id
+from ..storage import private_dir, write_json
+
+
+def general_steps():
+    prompts = json.loads(
+        (Path(__file__).parent / "anchors.json").read_text(encoding="utf-8")
+    )
+    return [
+        {
+            "id": digest(p),
+            "conversation": digest(p),
+            "split": "anchor",
+            "context": [{"role": "user", "content": p}],
+            "hindsight": [],
+            "tools": [],
+            "action": {},
+        }
+        for p in prompts
+    ]
+
+
+def preview(config, store):
+    from ..experience import refresh
+
+    refresh(config, store)
+    store.sync_steps(store.active_steps())
+    examples, conversations = store.feedback_counts()
+    if examples >= config.min_train and conversations >= config.min_heldout + 1:
+        store.assign_splits(minimum=config.min_heldout)  # settled splits never move
+    heldout = [s for s in store.active_steps("heldout") if s["hindsight"]]
+    if config.learning == "dreams":
+        # Real conversations never enter training: the pool is kept practice
+        # scenes. Held-out real conversations gate first; held-out practice
+        # lessons (never trained on) fill the places still missing.
+        from ..practice.pool import (
+            MOMENTS_PER_CONVERSATION,
+            ensure_heldout,
+            heldout_fill,
+            practice_steps,
+            real_test_steps,
+        )
+
+        # Every moment the user reacted to is a test (never trained on under
+        # Dreams); held-out practice lessons fill up to the usual size of the
+        # test set, more lessons held out on demand when short.
+        heldout = real_test_steps(store)
+        ensure_heldout(store, config.min_heldout)
+        train = practice_steps(store)
+        per = {}
+        for s in heldout:
+            per[s["conversation"]] = per.get(s["conversation"], 0) + 1
+        real = sum(min(n, MOMENTS_PER_CONVERSATION) for n in per.values())
+        heldout = heldout + heldout_fill(store, config.min_heldout - real)
+    else:
+        train = [s for s in store.active_steps("train") if s["hindsight"]]
+    info = {
+        "train": len(train),
+        "heldout": len(heldout),
+        "heldout_conversations": len({s["conversation"] for s in heldout}),
+        "pool": len(store.pool()),
+        "new": sum(
+            revision_id(s) > store.get("experience_watermark", 0) for s in train
+        ),
+        "calibrated": config.calibration_available,
+        "reason": "Waiting for experience"
+        if len(train) + len(heldout) < (1 if config.learning == "dreams" else config.min_train)
+        or not train
+        or (len(heldout) < 1 if config.learning == "dreams" else len({s["conversation"] for s in heldout}) < config.min_heldout)
+        else "Ready to score hindsight; final selection requires the model",
+    }
+    return info, train, heldout
+
+
+class Journal:
+    def __init__(self, root, check, store, slice_id):
+        self.root, self.check, self.store, self.slice_id = root, check, store, slice_id
+        self.phase, self.units = "record", 0
+
+    def load(self, name, default):
+        path = self.root / (name + ".json")
+        return (
+            json.loads(path.read_text(encoding="utf-8")) if path.exists() else default
+        )
+
+    def commit(self, name, value):
+        write_json(self.root / (name + ".json"), value)
+        self.units += 1
+        # Keep ended=NULL until the whole slice exits, including on a crash.
+        with self.store.connect() as db:
+            db.execute(
+                "UPDATE slices SET phase=?,units_done=? WHERE id=?",
+                (self.phase, self.units, self.slice_id),
+            )
+
+    def unit(self, name, fn):
+        path = self.root / (name + ".json")
+        if path.exists():
+            return json.loads(path.read_text(encoding="utf-8"))
+        self.check()
+        result = fn()
+        self.commit(name, result)
+        return result
+
+    def indivisible(self, name, fn):
+        # The planning deadline is checked before starting this unit. Once
+        # started, only activity/pause/memory cancellation can interrupt it.
+        return self.unit(name, lambda: fn(lambda: self.check(False)))
+
+
+def run(config, store, slice_seconds=None, sizing=None):
+    from ..practice.pool import drift_steps
+    from .evaluate import evaluate, references
+    from .fuse import candidate_kind, evaluation_model, export_candidate
+    from .gate import Decision, choose_scale, decide
+    from .prompts import OversizedStep, UnusableStep, paired_prompts
+    from .samples import SampleAdmission
+    from .select import bounded_batch, replay_pool, select
+
+    policy_config = config
+    lease = (store.root / "worker.lock").open("a+", encoding="utf-8")
+    acquire(lease)
+    interrupted, interrupted_by = False, None
+    deadline = (
+        time.monotonic() + slice_seconds if slice_seconds is not None else float("inf")
+    )
+    slice_id = store.slice()
+    admission = SampleAdmission(
+        config, sizing, store.get("calibration"), store, slice_id
+    )
+    night, record, journal = None, {}, None
+    power_platform = current()
+    next_power_check = 0
+    generation = store.get("candidate_generation")
+
+    def stop(*_):
+        nonlocal interrupted, interrupted_by
+        # The service records the real cause (agent activity, memory guard,
+        # paused, ...) when it stops a slice; this is only the fallback.
+        interrupted, interrupted_by = True, "stopped by the service"
+
+    for sig in (
+        signal.SIGTERM,
+        getattr(signal, "SIGUSR1", signal.SIGINT),
+        getattr(signal, "SIGBREAK", signal.SIGINT),
+    ):
+        signal.signal(sig, stop)
+
+    next_state_check = 0
+
+    def check(include_deadline=True):
+        """Stop now for a signal (traffic, a guard), battery, a pause or a
+        policy change. The slice deadline only when include_deadline: at a
+        unit boundary (a training step, a gate row), so a deadline never cuts
+        a unit midway and throws its work away (see boundary below)."""
+        nonlocal interrupted_by, next_power_check, next_state_check
+        if interrupted:
+            interrupted_by = interrupted_by or "stopped by the service"
+            raise Interrupted(interrupted_by)
+        now = time.monotonic()
+        # Sample at guard cadence, rather than spawning OS probes per token.
+        if now >= next_power_check:
+            next_power_check = now + config.guard_max_interval
+            if power_status(power_platform).constrained():
+                interrupted_by = "battery low"
+                raise Interrupted(interrupted_by)
+        # Stored state too: per-token checks must not read the database.
+        if include_deadline or now >= next_state_check:
+            next_state_check = now + config.guard_max_interval
+            from ..models.registry import find
+
+            model = find(store, config.model_key) if config.model_key else None
+            if store.get("candidate_generation") != generation:
+                raise Interrupted("learning policy changed")
+            if store.get("paused", False) or model and not model["enabled"]:
+                interrupted_by = interrupted_by or "paused"
+                raise Interrupted(interrupted_by)
+        if include_deadline and now >= deadline:
+            interrupted_by = "slice deadline"
+            raise Interrupted(interrupted_by)
+
+    def inner_check():
+        check(include_deadline=False)
+
+    try:
+        expected_seconds = (
+            slice_seconds
+            if slice_seconds is not None
+            else slice_duration(config, store.get("calibration"))
+        )
+        if power_status(power_platform).constrained(expected_seconds):
+            raise Interrupted("battery low")
+        info, train_steps, heldout = preview(config, store)
+        # Installations from before learning modes trained on real steps.
+        if store.get("learning_mode", "hindsight") != config.learning:
+            # Revisions count exchanges under hindsight and practice rows under
+            # dreams: what was trained under one says nothing about the other.
+            store.set("experience_watermark", 0)
+            store.set("practice_revisions", {})
+            store.set("learning_mode", config.learning)
+        if info["reason"] == "Waiting for experience":
+            return info
+        if not config.calibration_available:
+            raise ValueError("Calibration is required before training")
+        from .calibration_state import needs_growth
+
+        if needs_growth(config, store):
+            return info | {"reason": "Waiting for calibration growth"}
+        if sizing:
+            from .calibration_state import smallest_pending
+
+            if (
+                sizing.get("response_tokens", config.response_tokens)
+                < config.response_tokens
+            ):
+                return info | {"reason": "Waiting for calibration growth"}
+            shortest = smallest_pending(config, store.get("calibration") or {}, store)
+            if (
+                shortest is not None
+                and sizing.get("max_teacher_sequence", float("inf")) < shortest
+            ):
+                return info | {
+                    "reason": "Waiting for memory: intact training samples deferred"
+                }
+        from ..config import training_fingerprint
+
+        fingerprint = training_fingerprint(config)
+        base = base_fingerprint(config)
+        rebuild_attempt_key = rebuild_key(config, store)
+        if sizing:
+            config = replace(
+                config,
+                **{
+                    k: sizing[k]
+                    for k in (
+                        "max_sequence",
+                        "token_chunk",
+                    )
+                },
+            )
+        resumable = next(
+            (
+                n
+                for n in reversed(store.nights())
+                if can_resume(n, store, config, configuration=fingerprint, base=base)
+            ),
+            None,
+        )
+        if any(n["status"] == "ready" for n in store.nights()):
+            return info | {"reason": "Waiting to switch version"}
+        if not resumable and not rebuild_pending(policy_config, store):
+            watermark = store.get("experience_watermark", 0)
+            if config.learning == "dreams":
+                from ..practice.pool import untrained
+
+                fresh = any(
+                    not admission.known_unfit(s) for s in untrained(store, train_steps)
+                )
+            else:
+                fresh = store.unscored(train_steps) or any(
+                    revision_id(s) > watermark and not admission.known_unfit(s)
+                    for s in store.pool()
+                )
+            if not fresh:
+                return info | {"reason": "Waiting for new learnable experience"}
+        # Completed cycles and pending swaps allocate no training resources.
+        p = probe()
+        if (
+            not p.available
+            or (p.thermal is not None and p.thermal >= 2)
+            or p.pressure == "critical"
+        ):
+            raise ValueError(f"Hardware policy does not permit training: {p.dict()}")
+        from ..memory import TrainingPlatform
+
+        platform = Rooted(TrainingPlatform(current(), config), store.root)
+        if {a.kind for a in platform.accelerators()} <= {"cpu"} and not (
+            config.force_cpu_training or config.torch_options.get("force_cpu", False)
+        ):
+            raise ValueError(
+                "CPU is serving only; force_cpu_training enables measured trials"
+            )
+        kind = candidate_kind(config, platform)
+        from ..artifacts.storage import (
+            admit_storage,
+            artifact_root,
+            artifact_roots,
+            volume,
+        )
+
+        admit_storage(config, store, platform)
+        target = artifact_root(config, store)
+        if resumable:
+            previous_work = Path(
+                resumable["record"].get("work")
+                or store.root / "versions" / f"night-{resumable['id']}"
+            )
+            if volume(previous_work) != volume(target):
+                # A pending legacy unit may still point at the full data disk.
+                # Retire it; its selected experience remains in the durable pool.
+                store.night(resumable["id"], status="discarded")
+                resumable = None
+        night = resumable["id"] if resumable else store.night(None)
+        record = resumable["record"] if resumable else {}
+        work = (
+            Path(record["work"])
+            if record.get("work")
+            else target / "versions" / f"night-{night}"
+        )
+        owned = {"night": night, "installation_id": store.get("installation_id")}
+        if (
+            work.is_symlink()
+            or not any(
+                work.parent.resolve() == (r / "versions").resolve()
+                for r in artifact_roots(store.root)
+            )
+            or work.exists()
+            and (
+                not (work / "songe_work.json").is_file()
+                or json.loads((work / "songe_work.json").read_text(encoding="utf-8"))
+                != owned
+            )
+        ):
+            raise StorageWait(
+                f"Learning work is unavailable or no longer owned: {work}"
+            )
+        private_dir(work)
+        write_json(
+            work / "songe_work.json",
+            {"night": night, "installation_id": store.get("installation_id")},
+        )
+        record = (
+            resumable["record"]
+            if resumable
+            else {
+                "expected": store.get("current"),
+                "configuration": fingerprint,
+                "base_fingerprint": base,
+                "environment": store.get("environment_fingerprint"),
+                "generation": store.get("candidate_generation"),
+                "rebuild": rebuild_reason(config, store),
+                "rebuild_key": rebuild_attempt_key,
+                "steps_seen": len(train_steps),
+                "watermark": max((revision_id(s) for s in train_steps), default=0),
+                # For the cycle record (docs/CONTRACTS.md, Learning cycle).
+                "learning": config.learning,
+                "trigger": "dream" if store.get("requested_sleep", False) else "idle",
+                "started_at": time.time(),
+            }
+        )
+        record["work"] = str(work)
+        store.night(night, status="running", record=record)
+        if sizing:
+            record["slice_sizes"] = record.get("slice_sizes", []) + [sizing]
+            store.night(night, record=record)
+        journal = Journal(work, check, store, slice_id)
+        step_seconds, score_seconds = work_costs(config, store.get("calibration"))
+
+        shown = {}
+
+        def data_progress(phase, completed, total, seconds_per_unit, live=None):
+            if phase == "train" and shown.get(phase) != completed:
+                shown[phase] = completed
+                store.event("train", f"{completed} of {total} samples")
+            checkpoint, accumulation = {}, None
+            if phase == "train":
+                path = work / "checkpoint.json"
+                checkpoint = (
+                    json.loads(path.read_text(encoding="utf-8"))
+                    if path.exists()
+                    else {}
+                )
+                path = work / "training-plan.json"
+                plan = (
+                    json.loads(path.read_text(encoding="utf-8"))
+                    if path.exists()
+                    else {}
+                )
+                accumulation = plan.get("accumulation", backend.config.accumulation)
+                completed = max(completed, checkpoint.get("sample_cursor", 0))
+            # Measured in an earlier slice of this night: a restarted worker
+            # uses it until it has measured a step itself.
+            earlier = (record.get("data_progress") or {}).get("seconds_per_step")
+            record["data_progress"] = {
+                "phase": phase,
+                "completed": completed,
+                "total": total,
+                "unit": "experiences" if phase == "score" else "samples",
+                "eta_seconds": (total - completed) * seconds_per_unit
+                if seconds_per_unit > 0
+                else None,
+            }
+            if accumulation:
+                record["data_progress"].update(
+                    step=checkpoint.get(
+                        "iteration", math.ceil(completed / accumulation)
+                    ),
+                    total_steps=math.ceil(total / accumulation),
+                )
+            if phase == "train" and accumulation and earlier and not (
+                live and live.get("seconds_per_step")
+            ):
+                progress = record["data_progress"]
+                progress["seconds_per_step"] = earlier
+                progress["eta_seconds"] = max(
+                    0, progress["total_steps"] - progress["step"]
+                ) * earlier
+            if live and accumulation:
+                # The training loop's own step, losses and measured step time
+                # (the checkpoint lags them by minutes).
+                steps = record["data_progress"]["total_steps"]
+                record["data_progress"]["step"] = live["iteration"]
+                record["losses"] = live["losses"]
+                if live.get("seconds_per_step"):
+                    record["data_progress"]["eta_seconds"] = max(
+                        0, steps - live["iteration"]
+                    ) * live["seconds_per_step"]
+                    # The scheduler sizes the next slice by it (see
+                    # schedule.measured_step_seconds).
+                    record["data_progress"]["seconds_per_step"] = live[
+                        "seconds_per_step"
+                    ]
+            store.night(
+                night,
+                phase="select" if phase == "score" else "distill",
+                progress=(0 if phase == "score" else 0.2)
+                + (0.2 if phase == "score" else 0.5) * completed / max(1, total),
+                record=record,
+            )
+
+        backend_type = choose(config, platform)
+        # Inside a unit (per token, per micro-batch) the deadline is not
+        # checked; at unit boundaries backend.boundary() checks it.
+        backend = backend_type(config, inner_check)
+        backend.boundary = check
+        practice_token_limit = (sizing or {}).get(
+            "response_tokens", config.response_tokens
+        )
+        incumbent_version = store.version()
+        previous_adapter = (
+            (
+                incumbent_version.get("training_adapter")
+                or incumbent_version.get("adapter")
+            )
+            if incumbent_version and not record["rebuild"]
+            else None
+        )
+        if previous_adapter:
+            backend.restore(Path(previous_adapter))
+        baseline = backend.adapter_weights()
+        # This cycle's teacher is the version it starts from (DESIGN 3.3).
+        if previous_adapter and hasattr(backend, "snapshot_teacher"):
+            backend.snapshot_teacher()
+        journal.phase = "rewind"
+        from .lessons import extract_lessons, prune_lessons
+
+        # Under dreams, lessons come from read signals (reading/), not here.
+        lessons = (
+            []
+            if config.learning == "dreams"
+            else extract_lessons(
+                store, backend, journal, train_steps, token_limit=practice_token_limit
+            )
+        )
+        record["lessons"] = len(lessons)
+        store.night(night, phase="rewind", record=record)
+        if lessons:
+            # Once per round, however many times it resumes.
+            journal.unit(
+                "lessons-shown",
+                lambda: store.event("rewind", f"{len(lessons)} lessons") or True,
+            )
+        snapshot = journal.load("snapshot", None)
+        if snapshot:
+            pool, heldout = snapshot["pool"], snapshot["heldout"]
+        else:
+            def practiced_new():
+                from ..practice.pool import untrained
+
+                return train_steps if record["rebuild"] else untrained(store, train_steps)
+
+            experience = journal.unit(
+                "experience",
+                lambda: {
+                    "new": sorted(
+                        practiced_new()
+                        if config.learning == "dreams"
+                        else train_steps
+                        if record["rebuild"]
+                        else store.unscored(train_steps),
+                        key=revision_id,
+                    ),
+                    "heldout": heldout,
+                    "pool": train_steps
+                    if config.learning == "dreams"
+                    else store.pool(),
+                },
+            )
+            new, heldout = experience["new"], experience["heldout"]
+            new = admission.admit(new, backend.tokenizer)
+            if config.learning == "dreams":
+                # Practice was checked when it was written; the pool is every
+                # kept scene, the new ones first and older ones as replay.
+                selected, skipped = new, 0
+                pool = admission.admit(experience["pool"], backend.tokenizer)
+            else:
+                selected, skipped = select(new)
+                if new:
+                    store.event(
+                        "clean",
+                        f"kept {len(selected)} of {len(new)} new steps for training",
+                    )
+                store.add_pool(selected, scored=new)
+                if new:
+                    store.mark_scored(new)
+                    store.set(
+                        "score_watermark",
+                        max(
+                            store.get("score_watermark", 0),
+                            max(revision_id(s) for s in new),
+                        ),
+                    )
+                # An unfit revision also supersedes its older selected evidence.
+                rescored = {s["id"] for s in experience["new"]}
+                pool = [
+                    s for s in experience["pool"] if s["id"] not in rescored
+                ] + selected
+                pool = admission.admit(pool, backend.tokenizer)
+            if not record["rebuild"]:
+                pool = replay_pool(
+                    pool,
+                    store.get("experience_watermark", 0),
+                    config.replay_fraction,
+                    store.get("practice_revisions", {}),
+                )
+            from .calibration_state import pending_keys
+
+            pending_practice = pending_keys(store)
+            pool, remaining = bounded_batch(
+                pool,
+                config,
+                max(0, deadline - time.monotonic())
+                if slice_seconds is not None
+                else None,
+                step_seconds,
+                pending=pending_practice,
+                whole=config.learning == "dreams",
+            )
+            remaining = [
+                s for s in remaining if (s["id"], revision_id(s)) in pending_practice
+            ]
+            if remaining:
+                # Keep all scored/selected evidence in Store.pool for another
+                # cycle, without advancing past an untrained revision.
+                record["batch_watermark"] = min(revision_id(s) for s in remaining) - 1
+            record["scored_watermark"] = store.get("score_watermark", 0)
+            record["selected_revisions"] = {s["id"]: revision_id(s) for s in selected}
+            record["watermark"] = max(
+                (revision_id(s) for s in pool),
+                default=store.get("experience_watermark", 0),
+            )
+            deferred = [
+                s["revision"]
+                for s in admission.record["deferred_samples"]
+                if s["revision"] > store.get("experience_watermark", 0)
+            ]
+            if deferred:
+                # A p90 slice can train its intact majority while the tail
+                # waits for growth. Do not consume selected tail revisions.
+                record["watermark"] = min(record["watermark"], min(deferred) - 1)
+                record["batch_watermark"] = min(
+                    record.get("batch_watermark", min(deferred) - 1),
+                    min(deferred) - 1,
+                )
+            record["skipped_steps"] = skipped
+            if not pool:
+                record["reason"] = "Waiting for learnable experience"
+                store.night(night, status="waiting", record=record)
+                return record
+            usable = []
+            for step in admission.admit(heldout, backend.tokenizer, full_context=True):
+                check()
+                try:
+                    paired_prompts(
+                        backend.tokenizer,
+                        step,
+                        config,
+                        check_length=False,
+                    )
+                    usable.append(step)
+                except UnusableStep:
+                    pass
+            heldout = usable
+            # Under Dreams the minimum counts test moments (user decision).
+            units = len(heldout) if config.learning == "dreams" else len({s["conversation"] for s in heldout})
+            if units < (1 if config.learning == "dreams" else config.min_heldout):
+                record["reason"] = "Waiting for usable held-out conversations"
+                store.night(night, status="waiting", record=record)
+                return record
+            journal.commit("snapshot", {"pool": pool, "heldout": heldout})
+        prune_lessons(store)
+        # The night's gate set is fixed: the snapshot's held-out steps and the
+        # anchors first admitted. Memory deferral never shrinks it (see gate).
+        night_gate = heldout + journal.unit(
+            "gate-anchors", lambda: admission.admit(general_steps(), backend.tokenizer)
+        )
+        anchors = admission.admit(night_gate[len(heldout) :], backend.tokenizer)
+        drift_set = admission.admit(
+            journal.unit("gate-drift", lambda: drift_steps(store)), backend.tokenizer
+        )
+        heldout = admission.admit(heldout, backend.tokenizer, full_context=True)
+        training_anchors = journal.unit(
+            "anchors", lambda: anchors + [s | {"hindsight": []} for s in pool]
+        )
+        pool = admission.admit(pool, backend.tokenizer)
+        if not pool:
+            record.update(admission.record, reason="Waiting for learnable experience")
+            store.night(night, status="waiting", record=record)
+            return record
+        training_anchors = admission.admit(training_anchors, backend.tokenizer)
+        # Increase rehearsal using observed drift, preserving original-base teacher.
+        drift_ratio = (
+            min(1, store.get("cumulative_drift", 0) / config.general_drift_limit)
+            if config.general_drift_limit
+            else 0
+        )
+        backend.config = replace(
+            config,
+            # At most half rehearsal: a fraction near 1 would mean ~20 anchors
+            # per new example and almost nothing learned from the user.
+            anchor_fraction=min(
+                0.5,
+                config.anchor_fraction + (1 - config.anchor_fraction) * drift_ratio,
+            ),
+        )
+        policy = journal.unit(
+            "training-policy",
+            lambda: {
+                "anchor_fraction": backend.config.anchor_fraction,
+                "accumulation": policy_config.accumulation,
+            },
+        )
+        backend.config = replace(backend.config, **policy)
+        journal.phase = "train"
+        from ..backends.training import sample_plan
+
+        samples = len(
+            sample_plan(pool, training_anchors, backend.config.anchor_fraction)
+        )
+        previous_progress = journal.load("train-progress", {"completed": 0})
+        sample_seconds = step_seconds / config.accumulation
+        data_progress("train", previous_progress["completed"], samples, sample_seconds)
+
+        def progress(completed, total, live=None):
+            journal.commit("train-progress", {"completed": completed, "total": total})
+            data_progress("train", completed, total, sample_seconds, live)
+
+        def consolidate():
+            started = time.monotonic()
+            record["consolidate_started"] = True
+            store.night(night, record=record)
+            try:
+                return backend.train(pool, training_anchors, work, progress)
+            finally:
+                record["consolidate_seconds"] = record.get(
+                    "consolidate_seconds", 0
+                ) + max(0, time.monotonic() - started)
+                store.night(night, record=record)
+
+        result = journal.unit(
+            "trained",
+            consolidate,
+        )
+        # Checkpoints only resume training; once "trained" is recorded the
+        # final adapter is all that is read again.
+        import shutil
+
+        for old in work.glob("checkpoint-*"):
+            if old.is_dir():
+                shutil.rmtree(old, ignore_errors=True)
+        backend.restore(work / "adapter")
+        trained = backend.adapter_weights()
+        record.update(result, pool_size=len(pool))
+        # One loss per committed optimizer step, and how the samples split
+        # between practice and rehearsal, for the cycle record.
+        progress_file = work / "checkpoint.json"
+        if progress_file.exists():
+            record["losses"] = json.loads(progress_file.read_text(encoding="utf-8")).get(
+                "losses", []
+            )
+        record["samples"] = {"practice": len(pool), "rehearsal": max(0, samples - len(pool))}
+        record["practice_revisions"] = store.get("practice_revisions", {}) | {
+            s["id"]: revision_id(s) for s in pool
+        }
+        # The signals whose practice this Dream trained: once it is adopted,
+        # their Quick Dream lessons leave the prompt (quick.absorb).
+        record["trained_signals"] = sorted(
+            {s["signal_id"] for s in pool if s.get("practice") and s.get("signal_id")}
+        )
+        data_progress("train", samples, samples, sample_seconds)
+        if "trained_revisions" in result:
+            record["watermark"] = max(
+                result["trained_revisions"].values(),
+                default=store.get("experience_watermark", 0),
+            )
+        if "batch_watermark" in record:
+            record["watermark"] = min(
+                max(
+                    record["watermark"],
+                    max(record["practice_revisions"].values(), default=0),
+                ),
+                record["batch_watermark"],
+            )
+        else:
+            record["watermark"] = max(
+                record["watermark"],
+                max(record["practice_revisions"].values(), default=0),
+            )
+        journal.phase = "gate"
+        if config.learning == "dreams":
+            # Training is done: the checks run to the end instead of in
+            # planned slices (live: 11 five-minute slices, each reloading,
+            # 50 min instead of ~26). Agent activity, pause and the memory
+            # guard still stop it at once (signals and state checks).
+            deadline = float("inf")
+        store.night(night, phase="check", progress=0.7, record=record)
+        # A slice short on memory waits here, with training kept, instead of
+        # scoring a subset: results stay comparable and a finished gate stays
+        # finished across the night's slices.
+        # A sample longer than this machine ever measured is always deferred,
+        # so it is left out the same way every slice and never waited on.
+        measured = store.get("calibration") or {}
+        capacity = max(
+            [0]
+            + [r.get("teacher_sequence") or 0 for r in measured.get("rows", [])]
+            + [t.get("teacher_sequence") or 0 for t in measured.get("teacher_rows", [])]
+        )
+        waiting = {
+            s["id"]
+            for s in admission.record["deferred_samples"]
+            if (s.get("teacher_sequence") or 0) <= capacity
+        }
+        if any(s["id"] in waiting for s in night_gate):
+            raise Interrupted("Waiting for memory: intact training samples deferred")
+
+        # Gate work is cached by what it scores (the examples and response
+        # length), not by this slice's memory sizing, which changes almost
+        # every slice and would restart the gate forever.
+        def gate_key(steps):
+            return digest(
+                {
+                    "response_tokens": backend.config.response_tokens,
+                    "ids": [s.get("id") for s in steps],
+                }
+            )
+
+        # Progress through the gate, in conversations measured: references
+        # for the whole set, then the incumbent, then each strength tried.
+        # A measured pass skips the bundled prompts when the drift set can
+        # decide (see evaluate), so each pass is sized the way it will run.
+        from .evaluate import drift_choice
+
+        measured_counts, pass_sizes = {}, {}
+
+        def pass_size(cache=None):
+            values = (cache or {}).get("drift_set") or []
+            if len(values) < len(drift_set):
+                # Not measured yet: whether it decides depends on its size.
+                values = [0.0] * len(drift_set)
+            groups = [{"conversation": s.get("conversation")} for s in drift_set]
+            _, decided = drift_choice(None, values, groups, backend.config)
+            bundled = (cache or {}).get("drifts") or decided["source"] != "drift"
+            return len(heldout) + len(drift_set) + (len(anchors) if bundled else 0)
+
+        def gate_progress(name, count, cache=None):
+            if measured_counts.get(name) == count and name in pass_sizes:
+                return
+            measured_counts[name] = count
+            if not name.startswith("refs:"):
+                pass_sizes[name] = pass_size(cache)
+            # References, the incumbent and at least one strength. The
+            # bundled prompts' references count once they are requested.
+            bundled = any(k.startswith("refs:general-references") for k in measured_counts)
+            total = (
+                len(heldout) + len(drift_set) + len(anchors) if bundled else pass_size()
+            )
+            total += sum(pass_sizes.values())
+            total += pass_size() * max(0, 2 - len(pass_sizes))
+            completed = min(sum(measured_counts.values()), total)
+            record["data_progress"] = {
+                "phase": "check",
+                "completed": completed,
+                "total": total,
+                "unit": "measured",
+                "eta_seconds": None,
+            }
+            store.night(
+                night, phase="check", progress=0.7 + 0.25 * completed / max(1, total),
+                record=record,
+            )
+
+        # The original model's answers are kept across Dreams for the same
+        # base weights (see ReferenceCache): later Dreams skip resampling.
+        from .evaluate import ReferenceCache
+
+        reference_cache = ReferenceCache(store.root / "gate-references", base)
+
+        def reference_set(name, steps):
+            name += "-" + gate_key(steps)
+            rows = journal.load(name, [])
+            gate_progress("refs:" + name, len(rows))
+            for step in steps[len(rows) :]:
+                check()
+                rows.extend(references(backend, [step], cache=reference_cache))
+                journal.commit(name, rows)
+                gate_progress("refs:" + name, len(rows))
+            return rows
+
+        refs = reference_set("references", heldout)
+        drift_refs = reference_set("drift-references", drift_set)
+        # The bundled prompts' references only when the drift set cannot
+        # decide (evaluate asks for them then), once per cycle.
+        general_memo = []
+
+        def general_refs():
+            if not general_memo:
+                general_memo.append(reference_set("general-references", anchors))
+            return general_memo[0]
+
+        def measured(name, candidate, identical=False):
+            name += "-" + gate_key(heldout + anchors + drift_set)
+            cache = journal.load(name, {})
+
+            def commit():
+                journal.commit(name, cache)
+                gate_progress(
+                    name,
+                    sum(len(cache.get(k) or []) for k in ("drifts", "drift_set", "rows")),
+                    cache,
+                )
+
+            commit()
+            rows = evaluate(
+                backend,
+                candidate,
+                refs,
+                general_refs,
+                drift_refs=drift_refs,
+                checkpoint=cache,
+                commit=commit,
+                identical=identical,
+            )
+            # Which "not broken" measure gated, and why (see evaluate), and
+            # the measured values, for the cycle record's checks.
+            record.setdefault("drift_checks", {})[name] = cache.get("drift_check")
+            record.setdefault("gate_values", {})[name] = {
+                "held_out": mean(r["kl"] for r in rows) if rows else None,
+                "general": mean(cache["drifts"]) if cache.get("drifts") else None,
+                "drift": mean(cache["drift_set"]) if cache.get("drift_set") else None,
+                "count": len(rows),
+                "drift_count": len(cache.get("drift_set") or []),
+            }
+            return rows
+
+        # The incumbent and candidate share the original frozen base. Reuse
+        # its trunk so evaluating the incumbent does not load a second base.
+        if incumbent_version and (
+            incumbent_version.get("training_adapter")
+            or incumbent_version.get("adapter")
+        ):
+            backend.restore(
+                Path(
+                    incumbent_version.get("training_adapter")
+                    or incumbent_version["adapter"]
+                )
+            )
+            before = measured("before", backend)
+        else:
+            # The incumbent is the original: its drift from it is zero.
+            backend.scale_delta(baseline, trained, 0)
+            before = measured("before", backend, identical=True)
+        # Under Dreams the gate judges what each version writes (judged.py):
+        # the version in use answers each moment now, while it is loaded.
+        from . import judged
+
+        moments = judged.moments(heldout) if config.learning == "dreams" else []
+        before_answers = {}
+        if moments:
+            try:
+                before_answers = judged.answers(backend, journal, moments, "before", check)
+            except (Interrupted, MemoryError):
+                raise
+            except Exception as exc:  # noqa: BLE001 - judging falls back, never fails the Dream
+                import logging
+
+                logging.getLogger("songe").warning("judged_unavailable %s: %s", type(exc).__name__, exc)
+                record["judged_error"] = type(exc).__name__
+                moments = []
+
+        def with_outcomes(rows, scale):
+            """The gate's rows with each judged moment's outcome (win, loss,
+            tie) for this strength; the candidate is loaded at that strength."""
+            if not moments:
+                return rows  # the KL decides (judging unavailable)
+            backend.scale_delta(baseline, trained, scale)
+            try:
+                after_answers = judged.answers(backend, journal, moments, f"scale-{scale}", check)
+                verdicts = {r["id"]: r for r in judged.judge(
+                    backend, journal, moments, before_answers, after_answers, f"scale-{scale}", check)}
+            except (Interrupted, MemoryError):
+                raise
+            except Exception as exc:  # noqa: BLE001
+                import logging
+
+                logging.getLogger("songe").warning("judged_unavailable %s: %s", type(exc).__name__, exc)
+                record["judged_error"] = type(exc).__name__
+                return rows
+            finally:
+                backend.scale_delta(baseline, trained, scale)
+            return [r | ({"outcome": verdicts[r["id"]]["outcome"], "by": verdicts[r["id"]]["by"]}
+                         if r["id"] in verdicts else {}) for r in rows]
+
+        def scale_adapter(scale):
+            adapter = work / f"scale-{scale}-adapter"
+            backend.scale_delta(baseline, trained, scale)
+
+            def save():
+                backend.save(adapter)
+                return {"path": str(adapter)}
+
+            journal.unit(f"scaled-{scale}", save)
+            return adapter
+
+        def scale_artifact(scale, adapter):
+            if kind == "mlx-adapter":
+                return Path(config.model)
+            destination = scale_destination(scale)
+
+            def produce(urgent):
+                journal.phase = "fuse"
+                from .calibrate import admit_phase
+
+                admit_phase(config, store, platform, "export")
+                export_candidate(config, kind, adapter, destination, platform, urgent)
+                return {"path": str(destination)}
+
+            journal.indivisible(f"fused-{scale}", produce)
+            return destination
+
+        def scale_destination(scale):
+            suffix = ".gguf" if kind.startswith("gguf-") else ""
+            return (
+                Path(config.models_dir)
+                / config.publisher
+                / f"{config.public_model.split('/', 1)[1].replace('/', '-')}-night-{night}-scale-{scale}{suffix}"
+                if config.upstream == "lmstudio"
+                else work / f"scale-{scale}-artifact{suffix}"
+            )
+
+        def discard(scale):
+            # A failed strength leaves nothing behind before the next is built.
+            import shutil
+
+            from ..artifacts.runtime import remove_owned
+
+            if kind in {"mlx-fused", "gguf-full"}:
+                remove_owned(scale_destination(scale), store.get("installation_id"))
+            shutil.rmtree(work / f"scale-{scale}-adapter", ignore_errors=True)
+            # A rerun of this strength must build it again, not trust records
+            # of files that are gone.
+            for name in (f"scaled-{scale}", f"fused-{scale}"):
+                (journal.root / f"{name}.json").unlink(missing_ok=True)
+
+        def scaled(scale):
+            # A strength already measured in an earlier slice still counts in
+            # the gate's progress, though its verdict comes from the journal.
+            name = f"scale-{scale}-" + gate_key(heldout + anchors + drift_set)
+            cache = journal.load(name, {})
+            if cache:
+                gate_progress(
+                    name,
+                    sum(len(cache.get(k) or []) for k in ("drifts", "drift_set", "rows")),
+                    cache,
+                )
+            # The verdict's evidence is kept, so a resumed gate never reopens a
+            # discarded candidate.
+            rows = journal.unit(
+                f"scale-result-{scale}-{gate_key(heldout + anchors + drift_set)}",
+                lambda: evaluate_scale(scale),
+            )
+            values = record.setdefault("gate_values", {})
+            if name not in values and rows:
+                # Resumed after this strength was measured: its values come
+                # from the journal (live: a resumed night kept one strength's).
+                values[name] = {
+                    "held_out": mean(r["kl"] for r in rows),
+                    "general": mean(cache["drifts"]) if cache.get("drifts") else None,
+                    "drift": mean(cache["drift_set"]) if cache.get("drift_set") else None,
+                    "count": len(rows),
+                    "drift_count": len(cache.get("drift_set") or []),
+                }
+                record.setdefault("drift_checks", {}).setdefault(name, cache.get("drift_check"))
+            return rows
+
+        def evaluate_scale(scale):
+            scale_adapter(scale)
+            adapted = with_outcomes(measured(f"scale-{scale}", backend), scale)
+            adapter_verdict = decide(
+                before,
+                adapted,
+                min_heldout=config.min_heldout,
+                drift_limit=config.general_drift_limit,
+                confidence=config.gate_confidence,
+            )
+            if kind not in {"mlx-fused", "gguf-full"} or not adapter_verdict.accepted:
+                return adapted
+            adapter = work / f"scale-{scale}-adapter"
+            artifact = scale_artifact(scale, adapter)
+            from .calibrate import admit_phase
+
+            check()
+            admit_phase(config, store, platform, "fused_evaluation")
+            fused = backend_type(
+                replace(
+                    config,
+                    model=str(
+                        evaluation_model(
+                            config, kind, artifact, platform, lambda: check(False)
+                        )
+                    ),
+                ),
+                check,
+                train=False,
+            )
+            try:
+                journal.phase = "gate"
+                # The fused model is the same candidate: the judged outcomes stand.
+                outcomes = {r["id"]: r for r in adapted if r.get("outcome")}
+                return [r | ({"outcome": outcomes[r["id"]]["outcome"], "by": outcomes[r["id"]]["by"]}
+                             if r["id"] in outcomes else {})
+                        for r in measured(f"fused-evaluation-{scale}", fused)]
+            finally:
+                del fused
+                gc.collect()
+
+        scale, decision, scales = choose_scale(
+            scaled,
+            before,
+            config.wake_scales,
+            min_heldout=config.min_heldout,
+            drift_limit=config.general_drift_limit,
+            confidence=config.gate_confidence,
+            check=check,
+            discard=discard,
+        )
+        record["scale_evaluations"] = scales
+        record["wake_scale"] = scale
+        if scale is None:
+            last_measurement = next(reversed(scales.values()), {})
+            decision = Decision(
+                False,
+                "No adapter scale passed the real gate",
+                **{
+                    k: last_measurement.get(k)
+                    for k in ("heldout_change", "noise_margin", "general_drift")
+                },
+            )
+            artifact, adapter = work / "adapter", None
+        else:
+            adapter = scale_adapter(scale)
+            artifact = scale_artifact(scale, adapter)
+            record["layer_deltas"] = backend.layer_deltas(baseline)
+        if hasattr(backend, "teacher_gain"):
+            store.set(
+                "teacher_gain",
+                journal.unit("teacher-gain", lambda: backend.teacher_gain(heldout)),
+            )
+        if config.learning == "dreams" and not moments:
+            # Before/after examples the older way, only when the gate could
+            # not judge moments (the judged moments are the examples then).
+            from ..practice.pool import practice_steps
+            from .examples import original_moments, practice_moments
+            from .examples import run as run_examples
+
+            def examples_progress(done, total):
+                # After the gate: before/after answers compared so far.
+                record["data_progress"] = {
+                    "phase": "check",
+                    "completed": done,
+                    "total": total,
+                    "unit": "compared",
+                    "eta_seconds": None,
+                }
+                store.night(night, phase="check", record=record)
+
+            try:
+                journal.phase = "check"
+                sets = journal.unit(
+                    "example-sets",
+                    lambda: [
+                        ["original", original_moments(store)],
+                        [
+                            "held_out",
+                            practice_moments(
+                                store, practice_steps(store, split="held_out"), "held_out"
+                            ),
+                        ],
+                        [
+                            "trained",
+                            practice_moments(
+                                store, pool[: config.example_trained], "trained"
+                            ),
+                        ],
+                    ],
+                )
+                record.update(
+                    run_examples(
+                        backend,
+                        journal,
+                        sets,
+                        baseline=baseline,
+                        trained=trained,
+                        after_scale=scale
+                        if scale is not None
+                        else max(config.wake_scales),
+                        config=config,
+                        check=check,
+                        progress=examples_progress,
+                    )
+                )
+            except (Interrupted, MemoryError):
+                raise
+            except Exception as exc:  # noqa: BLE001 - examples illustrate, never decide
+                import logging
+
+                logging.getLogger("songe").exception("examples_failed")
+                record["examples_error"] = type(exc).__name__
+            finally:
+                if scale is not None:
+                    backend.scale_delta(baseline, trained, scale)
+            store.night(night, record=record)
+        if moments:
+            # The report shows what the gate decided on: the judged moments of
+            # the strength used, or, when none passed, the one that came
+            # closest (live: half strength scored 6/1, the report showed 4/1).
+            shown = scale if scale is not None else max(
+                config.wake_scales,
+                key=lambda k: (scales.get(str(k)) or {}).get("heldout_change") or float("-inf"))
+            rows = (scales.get(str(shown)) or {}).get("judged") or []
+            if rows:
+                after_answers = judged.answers(backend, journal, moments, f"scale-{shown}", check)
+                record["examples"] = judged.examples(moments, before_answers, after_answers, rows)
+                record["improved"] = judged.summary(rows)
+                record["judged"] = rows
+                if scale is not None:
+                    backend.scale_delta(baseline, trained, scale)
+            store.night(night, record=record)
+        record.update(decision.dict())
+        change = decision.heldout_change
+        store.event(
+            "eval",
+            " · ".join(
+                filter(
+                    None,
+                    [
+                        "passed" if decision.accepted else "kept previous version",
+                        f"held-out change {change:+.3f}"
+                        if isinstance(change, (int, float))
+                        else "",
+                        decision.reason,
+                    ],
+                )
+            ),
+        )
+        store.set(
+            "wake_last",
+            {
+                "at": time.time(),
+                "repeat_errors_delta": None,
+                "drift": decision.general_drift,
+                "swapped": False,
+                "expected": record["expected"],
+                "candidate": f"night-{night}" if decision.accepted else None,
+            },
+        )
+        if decision.accepted:
+            version_id = f"night-{night}"
+            record["candidate"] = {
+                "id": version_id,
+                "identifier": f"{config.public_model}:{store.get('installation_id')}-{version_id}"
+                if config.upstream == "ollama"
+                else (
+                    config.base_identifier
+                    if config.upstream == "llamacpp"
+                    else f"{config.public_model}/{version_id}"
+                ),
+                "artifact": str(artifact),
+                "adapter": str(artifact)
+                if kind in {"gguf-lora", "peft-adapter"}
+                else str(adapter),
+                "training_adapter": str(adapter),
+                "kind": kind,
+                "base": config.model_ref.get("path", config.model),
+                "created": time.time(),
+                "night": night,
+            }
+            record["ended_at"] = time.time()
+            store.night(
+                night, status="ready", phase="swap", progress=0.95, record=record
+            )
+        else:
+            record["ended_at"] = time.time()
+            store.night(
+                night, status="rejected", phase="check", progress=1, record=record
+            )
+            store.set("last_completed", time.time())
+            store.set("experience_watermark", record["watermark"])
+            store.set("practice_revisions", record["practice_revisions"])
+            if record["rebuild"]:
+                # A rejected rebuild is still a completed finite attempt. Wait
+                # for new evidence or a changed rebuild request before retrying.
+                store.set("completed_rebuild", record["rebuild_key"])
+        print(json.dumps(record), flush=True)
+        return record
+    except StorageWait as exc:
+        store.set("disk_wait", str(exc))
+        if night is not None:
+            record["reason"] = str(exc)
+            store.night(night, status="interrupted", record=record)
+        return {"reason": str(exc)}
+    except (Interrupted, OversizedStep) as exc:
+        interrupted_by = interrupted_by or str(exc) or "activity"
+        if night is not None:
+            record["reason"] = interrupted_by
+            store.night(night, status="interrupted", record=record)
+        return {"interrupted": True}
+    except BaseException as exc:
+        import logging
+
+        from ..memory import MemoryPressure
+        from ..telemetry import failure_hint
+
+        if isinstance(exc, (MemoryPressure, MemoryError)) or "[metal::malloc]" in str(
+            exc
+        ):
+            # Short memory is a wait, not a failure: the night keeps its work
+            # and resumes when there is room.
+            if night is not None:
+                record["reason"] = "Waiting for memory"
+                store.night(night, status="interrupted", record=record)
+            raise
+
+        store.set("child_error", failure_hint("Learning", store.root))
+        logging.getLogger("songe").exception(
+            "learning_failed", extra={"diagnostic": True}
+        )
+        if night is not None:
+            record["reason"] = (
+                f"Work failed; served version preserved. Diagnostics: {store.root / 'songe.log'}"
+            )
+            store.night(night, status="failed", record=record)
+        raise
+    finally:
+        import logging
+
+        from .cleanup import collect_work
+
+        try:
+            collect_work(store, policy_config)
+        except Exception:
+            logging.getLogger("songe").exception("work_cleanup_failed")
+        store.slice(
+            slice_id,
+            phase=journal.phase if journal else "record",
+            units_done=journal.units if journal else 0,
+            interrupted_by=interrupted_by,
+            record=admission.record,
+        )
+        lease.close()
+
+
+def isolated(config, store, *, dry_run=False, slice_seconds=None):
+    """Public/hardware entry: model work is always in an isolated guarded child."""
+    import subprocess
+    import sys
+
+    from ..memory import (
+        MemoryPressure,
+        TrainingPlatform,
+        guarded_run,
+        record_memory_stop,
+        snapshot,
+    )
+    from ..telemetry import configure
+
+    config.save(store.root)
+    configure(store.root)
+    argv = [
+        sys.executable,
+        "-m",
+        "songe.sleep.worker",
+        "--data-dir",
+        str(store.root),
+        "--child",
+    ]
+    if config.model_key:
+        argv += ["--model-key", config.model_key]
+    if dry_run:
+        argv += ["--dry-run"]
+    if slice_seconds is not None:
+        argv += ["--slice-seconds", str(slice_seconds)]
+    platform = None if dry_run else TrainingPlatform(current(), config)
+    sizing = None
+
+    def observe(sample):
+        history.observe(sample)
+        store.set("memory_pressure_history", history.data)
+
+    if not dry_run:
+        from .calibrate import calibrate
+        from .calibration_state import needs_growth
+
+        if needs_growth(config, store):
+            calibrate(config, store.root)
+            return {
+                "reason": "Measuring training size",
+                "calibration": store.get("calibration_progress"),
+            }
+    if not dry_run and config.calibration_available:
+        from .sizing import PressureHistory, choose_size, free_needed, waiting_reason
+
+        sample = snapshot(platform)
+        history = PressureHistory(store.get("memory_pressure_history", {}))
+        observe(sample)
+        sizing = choose_size(config, store.get("calibration"), sample, history.data)
+        if sizing is None:
+            calibration = store.get("calibration")
+            return {
+                "reason": waiting_reason(
+                    sample,
+                    history.data,
+                    free_needed(config, calibration, sample, history.data),
+                )
+            }
+        store.set("last_slice_size", sizing)
+        argv += ["--sizing", json.dumps(sizing)]
+    nights_before = store.nights()
+    try:
+        result = guarded_run(
+            argv,
+            platform=platform,
+            required_bytes=sizing["host_bytes"] if sizing else 0,
+            required_device_bytes=sizing["device_bytes"] if sizing else 0,
+            margin_bytes=sizing["margin_bytes"] if sizing else 0,
+            prediction_error_bytes=sizing["prediction_error_bytes"] if sizing else 0,
+            device_prediction_error_bytes=sizing["device_prediction_error_bytes"]
+            if sizing
+            else 0,
+            on_sample=observe if not dry_run and config.calibration_available else None,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+    except MemoryPressure as exc:
+        record_memory_stop(store, exc, nights_before=nights_before)
+        raise
+    if result.returncode:
+        from ..telemetry import failure_hint, log_child_stderr
+
+        log_child_stderr(getattr(result, "stderr", None))
+        raise RuntimeError(failure_hint("Learning", store.root))
+    if dry_run:
+        return json.loads(result.stdout)
+    if store.get("disk_wait"):
+        return {"reason": store.get("disk_wait")}
+    nights = store.nights()
+    return nights[-1]["record"] if nights else {"reason": "Waiting for experience"}
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--data-dir", type=Path, default=data_dir())
+    parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--slice-seconds", type=float)
+    parser.add_argument("--sizing", type=json.loads)
+    parser.add_argument("--child", action="store_true")
+    parser.add_argument("--model-key")
+    args = parser.parse_args()
+    config, store = Config.load(args.data_dir), Store(args.data_dir)
+    if args.model_key:
+        config = Config.for_model(args.data_dir, args.model_key)
+        store = store.scoped(args.model_key)
+    from ..telemetry import configure
+
+    configure(store.root)
+    if args.dry_run:
+        print(
+            json.dumps(
+                preview(config, store)[0]
+                if args.child
+                else isolated(config, store, dry_run=True),
+                indent=2,
+            )
+        )
+    elif args.child:
+        outcome = run(config, store, args.slice_seconds, args.sizing)
+        # Why a run ended (also one that never started a night): the
+        # service reads it to carry a pressed Deep Dream on, or say why not.
+        reason = outcome.get("reason") if isinstance(outcome, dict) else None
+        store.set("worker_outcome", {"reason": reason, "at": time.time()})
+        if reason:
+            logging.getLogger(__name__).info("worker_outcome %s", reason)
+    else:
+        # Standalone entry has the same guard as scheduler-owned workers.
+        import asyncio
+
+        from ..upstream import create
+
+        async def standalone():
+            upstream = create(config, store.root)
+            parked = store.get("parked_models", [])
+            with store.connect() as db:
+                managed = {r[0] for r in db.execute("SELECT identifier FROM versions")}
+            try:
+                if upstream:
+                    if parked:
+                        await upstream.restore(parked, managed)
+                    parked = await upstream.park(
+                        on_snapshot=lambda items: store.set("parked_models", items)
+                    )
+                result = await asyncio.to_thread(
+                    isolated, config, store, slice_seconds=args.slice_seconds
+                )
+                print(json.dumps(result))
+            finally:
+                if upstream:
+                    await upstream.restore(parked, managed)
+                    if store.version():
+                        await upstream.ensure(store.version())
+                    store.set("parked_models", [])
+
+        asyncio.run(standalone())
+
+
+if __name__ == "__main__":
+    from songe.telemetry import diagnostic_main
+
+    diagnostic_main(main)

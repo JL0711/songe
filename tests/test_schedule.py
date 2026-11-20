@@ -1,0 +1,355 @@
+from dataclasses import replace
+
+import pytest
+
+from songe.schedule import Probes, Scheduler, reason
+from songe.sleep.calibrate import derive
+
+
+def good():
+    return Probes(True, 1800, 0, 24, 16, True)
+
+
+@pytest.mark.parametrize(
+    "field,value,expected",
+    [
+        ("thermal", 2, "cool"),
+        ("free_gb", 1, "memory"),
+        ("pressure", "critical", "memory"),
+        ("available", False, "probes"),
+    ],
+)
+def test_hardware_conditions(config, field, value, expected):
+    config.calibration_available = True
+    config.calibrated_peak_gb = 2
+    assert expected in reason(
+        config, replace(good(), **{field: value}), enough=True, traffic_idle=1800
+    )
+
+
+def test_keyboard_activity_does_not_block_learning(config):
+    # Product rule: learning waits on proxy traffic and memory, not on whether
+    # someone is typing elsewhere on the machine.
+    config.calibration_available = True
+    probes = replace(good(), idle_seconds=1)
+    assert (
+        reason(config, probes, enough=True, traffic_idle=1800, now=100000)
+        == "Will sleep when idle"
+    )
+
+
+def test_all_scheduler_conditions(config):
+    config.calibration_available = True
+    args = dict(enough=True, traffic_idle=1800, now=100000)
+    assert reason(config, good(), **args) == "Will sleep when idle"
+    assert reason(config, good(), **(args | {"paused": True})) == "Paused"
+    assert "experience" in reason(config, good(), **(args | {"enough": False}))
+    assert "traffic" in reason(config, good(), **(args | {"traffic_idle": 1}))
+    assert (
+        reason(config, good(), **(args | {"last_completed": 99000}))
+        == "Will sleep when idle"
+    )
+
+
+def test_traffic_signals_child_without_wait(config, store, monkeypatch):
+    from songe import schedule
+
+    monkeypatch.setattr(
+        schedule, "interrupt_group", lambda child: child.send_signal("interrupt group")
+    )
+
+    class Child:
+        returncode = None
+        signals = []
+
+        def send_signal(self, s):
+            self.signals.append(s)
+
+    s = Scheduler(config, store, None)
+    s.process = Child()
+    s.traffic()
+    assert len(s.process.signals) == 1
+    s.traffic()
+    assert len(s.process.signals) == 1
+
+
+def test_calibration_uses_generation_memory_and_training():
+    rows = [
+        {
+            "sequence": 256,
+            "step_seconds": 1,
+            "generation_tps": 50,
+            "forward_seconds": 0.1,
+            "peak_memory_gb": 2,
+        },
+        {
+            "sequence": 2048,
+            "step_seconds": 4,
+            "generation_tps": 10,
+            "forward_seconds": 0.5,
+            "peak_memory_gb": 15,
+        },
+    ]
+    result = derive(rows, 10)
+    assert result["max_sequence"] == 256
+    assert result["calibrated_step_seconds"] == 4
+    assert result["calibrated_score_seconds"] == pytest.approx(2.66)
+    with pytest.raises(ValueError):
+        derive(rows, 1)
+
+
+async def test_proxy_restart_recovers_incomplete_night(config, store):
+    class Upstream:
+        async def close(self):
+            pass
+
+    store.night(None)
+    assert store.nights()[0]["status"] == "running"
+    scheduler = Scheduler(config, store, Upstream())
+    await scheduler.start()
+    await scheduler.close()
+    assert store.nights()[0]["status"] == "interrupted"
+
+
+async def test_ready_swap_waits_for_inflight_and_observed_duration(
+    config, store, monkeypatch
+):
+    import time
+
+    from songe.sleep import swap
+    from tests.test_store import version
+
+    calls = []
+
+    async def install(*args, **kw):
+        calls.append(True)
+        return True
+
+    monkeypatch.setattr(swap, "install", install)
+    store.add_version(version("base"))
+    store.swap("base", None)
+    record = {"candidate": version("candidate", 1), "expected": "base", "watermark": 1}
+    night = store.night(None, status="ready", record=record)
+    scheduler = Scheduler(config, store, None)
+    scheduler.acquire("base")
+    await scheduler.accept(store.nights()[0])
+    assert not calls
+    scheduler.release("base")
+    scheduler.last_traffic = time.monotonic() - 1
+    store.set("swap_durations", [10])
+    await scheduler.accept(store.nights()[0])
+    assert not calls and store.nights()[0]["id"] == night
+
+
+async def test_wake_stops_worker_then_restores_parked_user_models(
+    config, store, monkeypatch
+):
+    from songe import schedule
+
+    monkeypatch.setattr(
+        schedule, "interrupt_group", lambda child: child.send_signal("interrupt group")
+    )
+    from tests.test_store import version
+
+    events = []
+
+    class Upstream:
+        async def restore(self, parked, managed):
+            events.append(("restore", parked, managed))
+
+        async def ensure(self, version):
+            events.append(("ensure", version["id"]))
+
+    class Child:
+        returncode = None
+
+        def send_signal(self, signal):
+            events.append(("signal",))
+
+        async def wait(self):
+            self.returncode = 0
+            events.append(("wait",))
+
+    store.add_version(version("base"))
+    store.swap("base", None)
+    store.set("parked_models", [{"identifier": "user", "key": "key"}])
+    scheduler = Scheduler(config, store, Upstream())
+    scheduler.process = Child()
+    scheduler.traffic()
+    await scheduler.wake()
+    assert events[0] == ("signal",)
+    assert events[-2][0] == "restore" and events[-2][2] == {"base"}
+    assert events[-1] == ("ensure", "base")
+    assert store.get("parked_models") == []
+    assert scheduler.process is None
+
+
+def test_sleep_now_skips_only_the_idle_wait(config):
+    config.calibration_available = True
+    busy = dict(enough=True, traffic_idle=5, threshold=600)
+    assert "without proxy traffic" in reason(config, good(), **busy)
+    assert reason(config, good(), **busy, immediate=True) == "Will sleep when idle"
+    hot = replace(good(), thermal=2)
+    assert "cool" in reason(config, hot, **busy, immediate=True)
+
+
+def ready_night(config, store):
+    from songe.config import training_fingerprint
+    from songe.schedule import base_fingerprint
+    from tests.test_store import version
+
+    store.add_version(version("base"))
+    store.swap("base", None)
+    record = {
+        "candidate": version("candidate", 1),
+        "expected": "base",
+        "watermark": 1,
+        "configuration": training_fingerprint(config),
+        "base_fingerprint": base_fingerprint(config),
+        "environment": store.get("environment_fingerprint"),
+        "generation": store.get("candidate_generation"),
+    }
+    store.night(None, status="ready", record=record)
+
+
+async def test_update_waits_for_memory_and_is_never_thrown_away(
+    config, store, monkeypatch
+):
+    import time
+
+    from songe.memory import MemoryPressure
+    from songe.platform import Memory
+    from songe.sleep import swap
+
+    calls = []
+
+    async def install(*args, **kw):
+        calls.append(True)
+        raise MemoryPressure(Memory(1000, 10))
+
+    monkeypatch.setattr(swap, "install", install)
+    ready_night(config, store)
+    scheduler = Scheduler(config, store, None)
+    scheduler.last_traffic = time.monotonic() - 1000
+    for _ in range(5):
+        await scheduler.accept(store.nights()[0])
+        night = store.nights()[0]
+        # Retry later, not on the next tick; open the wait to try again.
+        await scheduler.accept(night)
+        store.night(night["id"], record=night["record"] | {"swap_retry_at": 0})
+    assert len(calls) == 5
+    night = store.nights()[0]
+    assert night["status"] == "ready"
+    assert "swap_failures" not in night["record"]
+
+
+async def test_update_the_server_refuses_is_rejected_after_three_spaced_tries(
+    config, store, monkeypatch
+):
+    import time
+
+    from songe.sleep import swap
+
+    calls = []
+
+    async def install(*args, **kw):
+        calls.append(True)
+        raise RuntimeError("bad weights")
+
+    monkeypatch.setattr(swap, "install", install)
+    ready_night(config, store)
+    scheduler = Scheduler(config, store, None)
+    scheduler.last_traffic = time.monotonic() - 1000
+    await scheduler.accept(store.nights()[0])
+    await scheduler.accept(store.nights()[0])
+    assert len(calls) == 1 and store.nights()[0]["status"] == "ready"
+    for _ in range(2):
+        night = store.nights()[0]
+        store.night(night["id"], record=night["record"] | {"swap_retry_at": 0})
+        await scheduler.accept(store.nights()[0])
+    assert len(calls) == 3 and store.nights()[0]["status"] == "rejected"
+
+
+async def test_update_loads_alone_when_it_does_not_fit_beside_the_current_one(
+    config, store, monkeypatch
+):
+    import time
+    from types import SimpleNamespace
+
+    from songe.memory import MemoryPressure
+    from songe.platform import Memory
+    from songe.sleep import swap
+
+    calls, parked = [], []
+
+    async def install(*args, **kw):
+        calls.append(True)
+        if len(calls) == 1:
+            raise MemoryPressure(Memory(1000, 10))
+        store.swap("candidate", "base")
+        return True
+
+    async def park(on_snapshot):
+        parked.append(True)
+        on_snapshot([{"identifier": "base"}])
+
+    async def collect(*args, **kw):
+        pass
+
+    monkeypatch.setattr(swap, "install", install)
+    monkeypatch.setattr(swap, "collect", collect)
+    ready_night(config, store)
+    from tests.test_store import version
+
+    store.add_version(version("candidate", 1))
+    scheduler = Scheduler(config, store, SimpleNamespace(park=park))
+    scheduler.last_traffic = time.monotonic() - 1000
+    await scheduler.accept(store.nights()[0])
+    assert parked and len(calls) == 2
+    assert store.nights()[0]["status"] == "accepted"
+    assert store.get("parked_models") == []
+
+
+def test_a_run_that_did_nothing_is_not_started_again_at_once(config, store):
+    scheduler = Scheduler(config, store, None)
+    scheduler.calibrating, scheduler.cancelled_at = False, None
+    store.slice(store.slice(), units_done=0)
+    scheduler.note_progress()
+    first = scheduler.empty_run_wait()
+    assert 0 < first <= 300
+    store.slice(store.slice(), units_done=0)
+    scheduler.note_progress()
+    assert scheduler.empty_run_wait() > first
+    # New conversations, or a run that did work, clear the wait.
+    store.set("experience_revision", "new")
+    assert scheduler.empty_run_wait() == 0
+    store.slice(store.slice(), units_done=0)
+    scheduler.note_progress()
+    assert scheduler.empty_run_wait() > 0
+    store.slice(store.slice(), units_done=3)
+    scheduler.note_progress()
+    assert scheduler.empty_run_wait() == 0
+    # Being interrupted by a request is not a run that did nothing.
+    scheduler.cancelled_at = 1.0
+    store.slice(store.slice(), units_done=0)
+    scheduler.note_progress()
+    assert scheduler.empty_run_wait() == 0
+
+
+def test_service_restarts_itself_onto_upgraded_code(config, store, monkeypatch):
+    from songe import upgrade
+
+    scheduler = Scheduler(config, store, None)
+    stopped = []
+    scheduler.shutdown = lambda: stopped.append(True)
+    scheduler.UPGRADE_CHECK_SECONDS = 0
+    assert not scheduler.upgraded()
+    monkeypatch.setattr(upgrade, "install_token", lambda: "new files")
+    # Seen once: the install may still be copying.
+    assert not scheduler.upgraded()
+    scheduler.acquire("m")
+    assert not scheduler.upgraded()  # never under an agent request
+    scheduler.release("m")
+    assert not scheduler.upgraded()  # nor between an agent's tool calls
+    scheduler.last_traffic -= 1000
+    assert scheduler.upgraded()

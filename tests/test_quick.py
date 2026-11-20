@@ -1,0 +1,738 @@
+import json
+
+import pytest
+
+from songe import quick
+
+
+@pytest.fixture(autouse=True)
+def one_session_is_enough(config):
+    # These tests put their signals in one session; the two-conversation bar
+    # for "always" lessons has its own test.
+    config.quick_min_sessions = 1
+
+
+def add_signal(store, sid, lesson, *, kind="correction", generality="kind", revision=1, text=None):
+    # The user's words: by default the lesson itself, as a stated rule.
+    text = lesson if text is None and kind in quick.USER else text or ""
+    payload = {"id": sid, "session": "s", "type": kind, "source": "user" if kind in quick.USER else "tool",
+               "lesson": lesson, "generality": generality, "revision": revision, "text": text}
+    with store.connect() as db:
+        db.execute("INSERT INTO signals VALUES (?,?,?,?,?,NULL)",
+                   (sid, store.model_id, "s", revision, json.dumps(payload)))
+
+
+def test_quick_dream_picks_preferences_and_tool_facts_not_skills(config, store):
+    add_signal(store, "c1", "Always use Conventional Commits for commit messages.", revision=1)
+    add_signal(store, "t1", "The execute tool runs JavaScript only; use the shell tool for shell commands.",
+               kind="tool_error", generality="always", revision=2)
+    add_signal(store, "t2", "The execute tool runs only JavaScript; run shell commands with the shell tool.",
+               kind="tool_error", generality="always", revision=3)
+    add_signal(store, "k1", "In Wordle keep letters marked G in place.", kind="outcome", revision=4)
+    add_signal(store, "x1", "Fix report.py line 3.", generality="task", revision=5)
+    result = quick.quick_dream(store, config, now=100.0)
+    lessons = quick.active(store)
+    # The repeated tool fact is one lesson and comes first; the skill and the
+    # task-only lesson wait for Deep Dream.
+    assert {k: result[k] for k in ("lessons", "added", "reworded", "dropped", "version")} == {
+        "lessons": 2, "added": 2, "reworded": 0, "dropped": 0, "version": 1}
+    assert len(result["changes"]["added"]) == 2
+    # The user's own rule first, then the repeated tool fact (one lesson).
+    assert lessons[0]["text"] == "Always use Conventional Commits for commit messages."
+    assert lessons[1]["signals"] == ["t2", "t1"] and lessons[1]["count"] == 2
+    assert "Wordle" not in quick.block(lessons) and quick.block(lessons).count("\n- ") == 2
+    # Nothing new: same version, no churn in the prompt.
+    assert quick.quick_dream(store, config, now=200.0)["version"] == 1
+
+
+def test_removed_lessons_never_return_and_absorbed_ones_leave(config, store):
+    add_signal(store, "c1", "Always use Conventional Commits for commit messages.", revision=1)
+    add_signal(store, "c2", "Always keep the README under 30 lines.", revision=2)
+    quick.quick_dream(store, config)
+    readme = next(lesson for lesson in quick.active(store) if "README" in lesson["text"])
+    quick.remove(store, readme["id"])
+    add_signal(store, "c3", "Always keep the README under 30 lines, please.", revision=3)
+    quick.quick_dream(store, config)
+    assert [lesson["text"] for lesson in quick.active(store)] == [
+        "Always use Conventional Commits for commit messages."]
+    # A Deep Dream that trained c1 was adopted: its lesson leaves the prompt.
+    assert quick.absorb(store, ["c1"]) == 1 and quick.active(store) == []
+    quick.quick_dream(store, config)
+    assert quick.active(store) == []
+    # A new correction brings it back.
+    add_signal(store, "c4", "Always use Conventional Commits for commit messages.", revision=4)
+    quick.quick_dream(store, config)
+    assert [lesson["signals"] for lesson in quick.active(store)] == [["c4"]]
+
+
+def test_at_most_the_configured_number(config, store):
+    config.prompt_lessons = 3
+    for i in range(6):
+        add_signal(store, f"c{i}", f"Always use preference number {i}: {'alpha beta gamma delta'.split()[i % 4]} {i * 7}",
+                   revision=i)
+    quick.quick_dream(store, config)
+    assert len(quick.active(store)) == 3
+
+
+def test_forget_clears_prompt_lessons(config, store):
+    add_signal(store, "c1", "Always use Conventional Commits for commit messages.")
+    quick.quick_dream(store, config)
+    assert quick.active(store)
+    store.forget()
+    assert quick.active(store) == []
+
+
+async def test_the_proxy_adds_the_sessions_lessons_to_the_system_prompt(config, store):
+    import httpx
+
+    from tests.test_proxy import pair, version
+
+    seen = []
+
+    from tests.test_proxy import Chunks
+
+    reply = json.dumps({"id": "x", "model": "night-1", "choices": [
+        {"index": 0, "message": {"role": "assistant", "content": "ok"}, "finish_reason": "stop"}]}).encode()
+
+    async def handler(request):
+        seen.append(request)
+        return httpx.Response(200, stream=Chunks([reply]), headers={"content-type": "application/json"})
+
+    store.add_version(version("night-1", 1))
+    store.swap("night-1", None)
+    add_signal(store, "c1", "Always use Conventional Commits for commit messages.")
+    quick.quick_dream(store, config)
+    app, upstream = await pair(config, store, handler)
+
+    def chat(first, *more):
+        return {"model": "songe/test", "messages": [
+            {"role": "system", "content": "You are an agent."},
+            {"role": "user", "content": first}, *more]}
+
+    async with (
+        app.router.lifespan_context(app),
+        httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://127.0.0.1") as client,
+    ):
+        await client.post("/v1/chat/completions", json=chat("commit this"))
+        # A Quick Dream adds a lesson mid-session.
+        add_signal(store, "c2", "Always keep the README under 30 lines.", revision=2)
+        quick.quick_dream(store, config)
+        await client.post("/v1/chat/completions", json=chat(
+            "commit this", {"role": "assistant", "content": "ok"}, {"role": "user", "content": "again"}))
+        await client.post("/v1/chat/completions", json=chat("a new task"))
+    await upstream.aclose()
+    system = [json.loads(r.content)["messages"][0]["content"] for r in seen]
+    assert system[0].startswith("You are an agent.\n\n" + quick.BLOCK)
+    assert "Conventional Commits" in system[0] and "README" not in system[0]
+    assert system[1] == system[0]  # the session keeps its lessons
+    assert "README" in system[2]  # the next session gets the new ones
+    # What Songe records is the agent's own request.
+    assert store.exchanges()[0]["request"]["messages"][0]["content"] == "You are an agent."
+
+
+async def test_controls_remove_a_lesson_and_check_the_dream_kind(config, store):
+    from types import SimpleNamespace
+
+    import httpx
+
+    from songe.proxy import create_app
+
+    add_signal(store, "c1", "Always use Conventional Commits for commit messages.")
+    quick.quick_dream(store, config)
+    lesson = quick.active(store)[0]
+    asked = []
+
+    async def dream(model, kind):
+        asked.append(kind)
+        return {"started": True, "message": "ok"}
+
+    app = create_app(config, store, scheduler=SimpleNamespace(dream=dream, active_model=None))
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://localhost") as client:
+        removed = await client.post("/api/control", json={"action": "remove_lesson", "id": lesson["id"]})
+        assert removed.json() == {"ok": True, "message": "Lesson removed"}
+        assert (await client.post("/api/control", json={"action": "dream", "kind": "quick"})).json()["kind"] == "quick"
+        assert (await client.post("/api/control", json={"action": "dream", "kind": "nap"})).status_code == 400
+        state = (await client.get("/api/state")).json()
+    assert quick.active(store) == [] and asked == ["quick"]
+    assert all(m.get("lessons") == [] for m in state["cycle"]["models"].values() if m)
+
+
+class FakeReader:
+    def __init__(self, answer):
+        self.answer, self.prompts = answer, []
+
+    async def ask(self, prompt, schema, name, **kw):
+        self.prompts.append(prompt)
+        return self.answer
+
+
+async def test_consolidation_merges_and_shortens_with_the_served_model(config, store):
+    tool = {"kind": "tool_error", "generality": "always"}
+    add_signal(store, "p1", "Always verify file paths and directory structures before writing files to disk.",
+               revision=1, **tool)
+    add_signal(store, "p2", "Always verify that the write tool is called with the correct full path.",
+               revision=2, **tool)
+    add_signal(store, "g1", "Always use the game's feedback after each guess.", revision=3, **tool)
+    clusters = quick.candidates(store, 30, config.quick_min_sessions)
+    assert len(clusters) == 3  # different wording: not merged by words alone
+    order = [c["signals"][0] for c in clusters]
+    reader = FakeReader({"lessons": [
+        {"text": "Check the full path before writing a file.",
+         "from": [order.index("p1") + 1, order.index("p2") + 1]},
+        {"text": "", "from": [1]}, {"text": "No source.", "from": [99]}]})
+    merged = await quick.consolidate(reader, clusters, config.prompt_lessons)
+    assert merged == [{"text": "Check the full path before writing a file.", "signals": ["p1", "p2"]}]
+    assert "game" in reader.prompts[0]  # the candidates were shown, numbered
+    quick.quick_dream(store, config, merged=merged)
+    (lesson,) = quick.active(store)
+    assert lesson["count"] == 2 and "game" not in quick.block(quick.active(store))
+    # An unusable answer: the caller keeps the candidates as they are.
+    assert await quick.consolidate(FakeReader("not json"), clusters, 10) is None
+    assert await quick.consolidate(FakeReader({"other": 1}), clusters, 10) is None
+
+
+def test_the_prompt_lessons_stay_within_their_budget(config, store):
+    merged = [{"text": f"Instruction {i} " + "word " * 25, "signals": [f"s{i}"]} for i in range(10)]
+    quick.quick_dream(store, config, merged=merged)
+    kept = quick.active(store)
+    assert 0 < len(kept) < 10
+    assert sum(len(lesson["text"]) for lesson in kept) <= quick.PROMPT_CHARS
+
+
+def test_skill_lessons_wait_for_a_deep_dream(config, store):
+    add_signal(store, "c1", "Always use Conventional Commits for commit messages.", revision=1)
+    add_signal(store, "k1", "In Wordle keep letters marked G in place.", kind="outcome", revision=2)
+    add_signal(store, "k2", "In Wordle, keep the letters marked G in their place.", kind="outcome", revision=3)
+    add_signal(store, "x1", "Fix report.py line 3.", generality="task", revision=4)
+    quick.quick_dream(store, config)
+    waiting = quick.waiting(store)
+    assert waiting["total"] == 1 and waiting["lessons"][0]["count"] == 2
+    store.set("trained_signals", ["k1", "k2"])  # a Deep Dream trained them
+    assert quick.waiting(store)["total"] == 0
+
+
+async def test_review_drops_one_kind_lessons_and_folds_repeats(config, store):
+    answers = iter([
+        {"scope": "general", "covered_by": 0},
+        {"scope": "general", "covered_by": 1},   # says the same as the first
+        {"scope": "one_kind", "covered_by": 0},  # a game lesson
+        "unusable",                              # kept as it is
+    ])
+
+    class Reviewer:
+        async def ask(self, prompt, schema, name, **kw):
+            return next(answers)
+
+    merged = [{"text": "Check the full path before writing a file.", "signals": ["p1"]},
+              {"text": "Confirm the target directory before writing.", "signals": ["p2"]},
+              {"text": "Use the game's feedback after each guess.", "signals": ["g1"]},
+              {"text": "Always use Conventional Commits for commit messages.", "signals": ["c1"]}]
+    kept = await quick.review(Reviewer(), merged)
+    assert [k["text"] for k in kept] == ["Check the full path before writing a file.",
+                                         "Always use Conventional Commits for commit messages."]
+    assert kept[0]["signals"] == ["p1", "p2"]
+
+
+def test_a_running_quick_dream_is_not_shown_as_a_cycle(config, store):
+    import time
+
+    from songe.cycle import model_learning
+
+    now = time.time()
+    early = model_learning(config, store, "m", {"stage": "read", "started_at": now - 60, "kind": "quick",
+                                                "total": 10, "done": 2, "budget": 300, "paces": [1.0, 2.0]})
+    assert early["current"] is None and early["quick_running"]["eta_seconds"] is None  # not 3 timed yet
+    running = model_learning(config, store, "m", {"stage": "read", "started_at": now - 60, "kind": "quick",
+                                                  "total": 10, "done": 4, "budget": 300, "paces": [8.0, 10.0, 12.0]})
+    view = running["quick_running"]
+    assert (view["done"], view["total"]) == (4, 10)
+    # 6 left at the recent 10 s each = 60 s, within the 240 s left of the budget.
+    assert 55 <= view["eta_seconds"] <= 65
+    slow = model_learning(config, store, "m", {"stage": "read", "started_at": now - 60, "kind": "quick",
+                                               "total": 10, "done": 4, "budget": 300, "paces": [50.0, 60.0, 70.0]})
+    assert 235 <= slow["quick_running"]["eta_seconds"] <= 245  # capped by the budget
+    # Idle reading is Quick Dream's first half: shown the same way, not as a Deep Dream.
+    idle = model_learning(config, store, "m", {"stage": "read", "started_at": now, "kind": "read"})
+    assert idle["current"] is None and idle["quick_running"]["kind"] == "read"
+    deep = model_learning(config, store, "m", {"stage": "read", "started_at": 5.0, "kind": "deep"})
+    assert deep["current"] is not None and deep["quick_running"] is None
+
+
+def test_quick_dream_reports_reworded_and_dropped(config, store):
+    add_signal(store, "t1", "The execute tool runs JavaScript only; use the shell tool for shell commands.",
+               kind="tool_error", generality="always", revision=1)
+    add_signal(store, "c2", "Always keep the README under 30 lines.", revision=2)
+    quick.quick_dream(store, config)
+    result = quick.quick_dream(store, config, merged=[
+        {"text": "Run shell commands with the shell tool.", "signals": ["t1"]}])
+    assert (result["added"], result["reworded"], result["dropped"]) == (0, 1, 1)
+
+
+def test_every_quick_dream_joins_the_history_and_quiet_ones_share_a_chip(config, store):
+    """User decision (live: a Quick Dream read 5 conversations, found 9
+    moments, added nothing, and left no trace): every finished Quick Dream
+    is in the history; back-to-back ones that changed nothing are one chip."""
+    from songe.cycle import dreams
+
+    add_signal(store, "c1", "Always use Conventional Commits for commit messages.", revision=1)
+    first = quick.record(store, quick.quick_dream(store, config), at=10.0)
+    assert first["id"] == "q-0001" and first["added"] == ["Always use Conventional Commits for commit messages."]
+    quiet = quick.record(store, quick.quick_dream(store, config), at=20.0, read=5, found=9)
+    assert quiet["id"] == "q-0002" and quiet["added"] == [] and (quiet["read"], quiet["found"]) == (5, 9)
+    quick.record(store, quick.quick_dream(store, config), at=30.0, read=2, found=0)
+    failed = quick.record(store, quick.quick_dream(store, config), at=40.0, read=0, found=0, error="no_model")
+    assert failed["error"] == "no_model"
+    row = dreams(store)
+    # Newest first: the failure, then the two quiet runs as one chip, then the first.
+    assert [d["id"] for d in row] == ["q-0004", "q-0003", "q-0001"]
+    assert row[1]["repeat"] == 2 and row[1]["read"] == 2 and row[0]["error"] == "no_model"
+
+
+def test_the_dream_row_lists_quick_and_deep_dreams_with_seen(config, store):
+    from songe.cycle import dreams, mark_seen
+
+    night = store.night(None)
+    store.night(night, status="rejected", record={"ended_at": 20.0, "reason": "Held-out improvement does not exceed bootstrap noise"})
+    add_signal(store, "c1", "Always use Conventional Commits for commit messages.")
+    quick.record(store, quick.quick_dream(store, config), at=30.0)
+    row = dreams(store)
+    assert [(d["id"], d["kind"], d["seen"]) for d in row] == [("q-0001", "quick", False), ("c-0001", "deep", False)]
+    assert row[1]["outcome"] == "kept" and row[0]["changes"]["added"]
+    mark_seen(store, "c-0001")
+    assert [d["seen"] for d in dreams(store)] == [False, True]
+
+
+def test_published_lessons_keep_their_wording(config, store):
+    add_signal(store, "c1", "Always use Conventional Commits for commit messages.", revision=1)
+    quick.quick_dream(store, config)
+    (first,) = quick.active(store)
+    # The same lesson again, worded differently, and a new one.
+    add_signal(store, "c2", "Always use Conventional Commits with an imperative subject.", revision=2)
+    add_signal(store, "c3", "Always keep the README under 30 lines.", revision=3)
+    clusters = quick.candidates(store, 30, config.quick_min_sessions)
+    kept, fresh = quick.split(store, [c for c in clusters if c["signals"] != ["c3"]]
+                              + [{"text": "Short READMEs.", "signals": ["c3"]}])
+    assert [k["text"] for k in kept] == [first["text"]] and len(fresh) >= 1
+    result = quick.quick_dream(store, config, merged=fresh, kept=kept)
+    lessons = quick.active(store)
+    assert lessons[0]["text"] == first["text"] and lessons[0]["id"] == first["id"]
+    assert result["changes"]["added"] and not result["changes"]["reworded"]
+
+
+def test_the_users_own_rule_and_no_padding(config, store):
+    add_signal(store, "u1", "Confirm package manager preferences before installing packages.",
+               text="Always use pnpm for packages here, never npm.", revision=1)
+    add_signal(store, "t1", "Always verify that the write tool gets the full path.", kind="tool_error",
+               generality="always", revision=2)
+    quick.quick_dream(store, config)
+    texts = [lesson["text"] for lesson in quick.active(store)]
+    assert "Always use pnpm for packages here, never npm." in texts
+    assert "Check that the write tool gets the full path." in texts
+    assert quick.tidy("Always verify file paths before writing files.") == "Check file paths before writing files."
+    assert quick.tidy("Always ensure that tests pass.") == "Make sure tests pass."
+    assert quick.tidy(quick.tidy("Always verify that x works.")) == quick.tidy("Always verify that x works.")
+
+
+def test_only_a_rule_shaped_sentence_of_the_users_counts(config, store):
+    by_id = {
+        "a": {"type": "correction", "text": "Please remove those comments. Never add comments to the code unless I ask for them."},
+        "b": {"type": "correction", "text": "You burned the entire game by repeating APPLE instead of playing from the feedback."},
+    }
+    assert quick.user_rule(by_id, ["a"]) == "Never add comments to the code unless I ask for them."
+    assert quick.user_rule(by_id, ["b"]) is None
+
+
+def test_the_users_rules_are_kept_first(config, store):
+    store.set(quick.KEY, {"version": 1, "updated_at": 1, "removed": [], "lessons": [
+        {"id": "p", "text": "Always use pnpm for packages here, never npm.", "signals": ["u1"], "count": 1,
+         "added_at": 1, "rule": True}]})
+    merged = [{"text": f"Tool lesson {i} " + "word " * 20, "signals": [f"t{i}{j}" for j in range(5)]} for i in range(6)]
+    quick.quick_dream(store, config, merged=merged, kept=quick.active(store))
+    assert quick.active(store)[0]["text"] == "Always use pnpm for packages here, never npm."
+
+
+def test_a_recurrent_lesson_is_never_cut_for_a_rarer_one(config, store):
+    merged = [{"text": "Rare lesson " + "word " * 40, "signals": ["r1"]},
+              {"text": "Frequent lesson " + "word " * 40, "signals": ["f1", "f2", "f3"]}]
+    quick.quick_dream(store, config, merged=merged)
+    assert [lesson["count"] for lesson in quick.active(store)][0] == 3
+
+
+def test_a_users_rule_counts_only_its_own_sentence(config, store):
+    """Live run: one correction showed as x10 (look-alike lessons joined its
+    cluster), and two pnpm signals made the same rule appear twice."""
+    add_signal(store, "u1", "Do not add comments to code unless asked.",
+               text="Please remove those comments. Never add comments to the code unless I ask for them.", revision=1)
+    for i in range(5):  # look-alike tool lessons about code comments
+        add_signal(store, f"t{i}", f"Do not add stray comments to code number {i}.", kind="tool_error",
+                   generality="always", revision=2 + i)
+    add_signal(store, "p1", "Prefer pnpm.", text="Always use pnpm for packages here, never npm.", revision=10)
+    add_signal(store, "p2", "Use pnpm, not npm.", kind="retry", text="Always use pnpm for packages here, never npm.",
+               revision=11)
+    quick.quick_dream(store, config)
+    lessons = {lesson["text"]: lesson["count"] for lesson in quick.active(store)}
+    assert lessons["Never add comments to the code unless I ask for them."] == 1
+    assert lessons["Always use pnpm for packages here, never npm."] == 2
+    assert sum(1 for t in lessons if "pnpm" in t) == 1
+
+
+def test_stems_merge_near_duplicates():
+    assert quick.similar("Check JavaScript syntax validity before running.",
+                         "Check the JavaScript syntax is valid before you run it.")
+
+
+def test_only_standing_rules_count_and_echoes_are_rejected():
+    rule = quick.rule_sentence
+    assert rule("Wrong commit message. Use Conventional Commits for every commit.") == "Use Conventional Commits for every commit."
+    assert rule("Always use pnpm for packages here, never npm.") == "Always use pnpm for packages here, never npm."
+    assert rule("Stop doing whatever that was.") is None
+    assert rule("Keep guessing from the feedback, don't go hunting for the answer.") is None
+    assert rule("Never do that again.") is None  # too short to stand on its own
+    assert quick.ECHO.search("Merge lessons 1, 2, 4 into one instruction: check paths.")
+    assert not quick.ECHO.search("Check file paths before writing files.")
+
+
+def test_lessons_published_under_looser_rules_leave(config, store):
+    add_signal(store, "u1", "Do something.", text="Stop doing whatever that was.", revision=1)
+    add_signal(store, "t1", "Check file paths before writing files.", kind="tool_error", generality="always", revision=2)
+    store.set(quick.KEY, {"version": 1, "updated_at": 1, "removed": [], "lessons": [
+        {"id": "a", "text": "Stop doing whatever that was.", "signals": ["u1"], "count": 1, "added_at": 1, "rule": True},
+        {"id": "b", "text": "Merge lessons 1, 2 into one instruction: check paths.", "signals": ["t1"], "count": 1,
+         "added_at": 1}]})
+    kept, fresh = quick.split(store, quick.candidates(store, 30, config.quick_min_sessions))
+    assert kept == []
+    quick.quick_dream(store, config, merged=fresh, kept=kept)
+    assert [lesson["text"] for lesson in quick.active(store)] == ["Check file paths before writing files."]
+
+
+def test_long_lessons_are_trimmed_to_their_core():
+    assert quick.tidy("Check that the write tool is called with the correct full path, including the target file "
+                      "name and directory structure, before attempting to create or overwrite files.") == \
+        "Check that the write tool is called with the correct full path."
+    assert quick.tidy("Always validate syntax and file integrity using the correct tool and language environment "
+                      "before proceeding with edits.") == "Always validate syntax and file integrity."
+    short = "Run shell commands with the shell tool."
+    assert quick.tidy(short) == short and quick.tidy(quick.tidy(short)) == short
+
+
+def test_the_short_form_from_reading_is_preferred(config, store):
+    payload = {"id": "t1", "session": "s", "type": "tool_error", "source": "tool", "generality": "always",
+               "revision": 1, "lesson": "When creating or running commands that involve file paths and arguments, "
+               "always verify the current working directory and ensure input file paths exist before executing.",
+               "short": "Check the working directory and that input paths exist first."}
+    with store.connect() as db:
+        db.execute("INSERT INTO signals VALUES (?,?,?,?,?,NULL)", ("t1", store.model_id, "s", 1, json.dumps(payload)))
+    quick.quick_dream(store, config)
+    assert [lesson["text"] for lesson in quick.active(store)] == ["Check the working directory and that input paths exist first."]
+
+
+def test_trimming_never_leaves_a_fragment():
+    long = ("Check that the program entry point is correctly invoked and the code is syntactically valid JavaScript "
+            "before running it with the test harness provided.")
+    out = quick.tidy(long)
+    assert len(out.split()) >= 6 and out.endswith(".")
+
+
+def test_signals_without_a_short_form_are_read_again(config, store):
+    from songe.reading import store as reading
+
+    add_signal(store, "c1", "Always use Conventional Commits for commit messages.")
+    with store.connect() as db:
+        db.execute("INSERT INTO read_sessions VALUES (?,?,?,?)", ("s", store.model_id, 1, 0.0))
+    assert reading.reread_without_short(store) == 1
+    with store.connect() as db:
+        assert db.execute("SELECT COUNT(*) FROM read_sessions").fetchone()[0] == 0
+
+
+def test_always_lessons_need_two_conversations(config, store):
+    config.quick_min_sessions = 2
+    tool = {"kind": "tool_error", "generality": "always"}
+    add_signal(store, "t1", "Check remaining guesses before each guess.", revision=1, **tool)
+    add_signal(store, "u1", "Never add comments unless asked.", text="Never add comments to the code unless I ask.",
+               revision=2)
+    quick.quick_dream(store, config)
+    assert [lesson["text"] for lesson in quick.active(store)] == ["Never add comments to the code unless I ask."]
+
+
+def test_a_published_lesson_takes_its_short_form_and_keeps_its_id(config, store):
+    payload = {"id": "t1", "session": "s", "type": "tool_error", "source": "tool", "generality": "always",
+               "revision": 1, "lesson": "Check that the program entry point is invoked correctly.",
+               "short": "Run the program's entry point before saying it works."}
+    with store.connect() as db:
+        db.execute("INSERT INTO signals VALUES (?,?,?,?,?,NULL)", ("t1", store.model_id, "s", 1, json.dumps(payload)))
+    store.set(quick.KEY, {"version": 1, "updated_at": 1, "removed": [], "lessons": [
+        {"id": "old", "text": "Check that the program entry point.", "signals": ["t1"], "count": 1, "added_at": 5}]})
+    result = quick.quick_dream(store, config)
+    (lesson,) = quick.active(store)
+    assert lesson["text"] == "Run the program's entry point before saying it works."
+    assert (lesson["id"], lesson["added_at"], result["added"]) == ("old", 5, 0)
+
+
+def test_the_quick_view_says_what_it_reads_and_finds(config, store):
+    import time
+
+    from songe.cycle import model_learning
+    from songe.reading import store as reading
+
+    assert reading.opening_request([{"kind": "action"}, {"kind": "user", "content": "Add a --json flag  to report.py"}]) \
+        == "Add a --json flag to report.py"
+    assert reading.signal_line({"type": "correction", "source": "user", "text": "Never add comments.",
+                                "short": "No comments."}) == {"type": "correction", "text": "Never add comments."}
+    assert reading.signal_line({"type": "tool_error", "source": "tool", "short": "Use the shell tool.",
+                                "evidence": "SyntaxError"})["text"] == "Use the shell tool."
+    view = model_learning(config, store, "m", {
+        "kind": "quick", "stage": "read", "started_at": time.time(), "total": 3, "done": 1, "budget": 300,
+        "read_seconds": 5.0, "reading": "Add a --json flag", "found": [{"type": "correction", "text": "x"}],
+        "found_count": 1})["quick_running"]
+    assert (view["reading"], view["found_count"], view["found"][0]["type"]) == ("Add a --json flag", 1, "correction")
+
+
+def test_the_moment_a_lesson_came_from(config, store):
+    request = {"messages": [{"role": "system", "content": "agent"}, {"role": "user", "content": "Add lodash"}]}
+    exchange = store.record("/v1/chat/completions", request, {"choices": []})
+    payload = {"id": "t1", "session": "s", "type": "tool_error", "source": "tool", "generality": "always",
+               "revision": 1, "lesson": "Use pnpm.", "exchanges": {"2": exchange}, "evidence": "npm: not allowed"}
+    with store.connect() as db:
+        db.execute("INSERT INTO signals VALUES (?,?,?,?,?,NULL)", ("t1", store.model_id, "s", 1, json.dumps(payload)))
+    found = quick.moment(store, {"signals": ["t1"]})
+    assert found["request"] == request and found["asked"] == "Add lodash" and found["feedback"] == "npm: not allowed"
+    assert quick.moment(store, {"signals": ["missing"]}) is None
+
+
+async def test_before_and_after_on_the_same_request():
+    seen = []
+
+    class Client:
+        async def post(self, url, json):
+            seen.append(json)
+            lessons = "pnpm" in json["messages"][0]["content"]
+            call = {"function": {"name": "shell", "arguments": '{"command": "%s"}' % (
+                "pnpm add lodash" if lessons else "npm install lodash")}}
+
+            class R:
+                def raise_for_status(self):
+                    pass
+
+                def json(self):
+                    return {"choices": [{"message": {"content": "", "tool_calls": [call]}}]}
+            return R()
+
+    request = {"model": "x", "stream": True, "messages": [{"role": "system", "content": "agent"},
+                                                          {"role": "user", "content": "Add lodash"}]}
+    before, after, changed = await quick.compare(Client(), "http://m/v1", "served", request, "",
+                                                 quick.block([{"text": "Always use pnpm, never npm."}]), server="vllm")
+    assert changed and before["tool_calls"][0]["arguments"] == {"command": "npm install lodash"}
+    assert after["tool_calls"][0]["arguments"] == {"command": "pnpm add lodash"}
+    assert seen[0]["temperature"] == 0 and seen[0]["stream"] is False and seen[0]["model"] == "served"
+    assert seen[0]["chat_template_kwargs"] == {"enable_thinking": False}
+    same = await quick.compare(Client(), "http://m/v1", "served", request, "", quick.block([{"text": "Be brief."}]))
+    assert same[2] is False
+
+
+def test_task_instructions_are_not_standing_rules():
+    rule = quick.rule_sentence
+    assert rule("Use the feedback from each guess.") is None  # an instruction for this task
+    assert rule("Please use the feedback from each guess.") is None
+    assert rule("Use pnpm for packages, never npm.") == "Use pnpm for packages, never npm."
+    assert rule("Use tabs instead of spaces in this project.") == "Use tabs instead of spaces in this project."
+    assert rule("Always write tests with pytest, never unittest.") is not None
+    assert quick.normal("Please always use pnpm here.") == quick.normal("Always use pnpm here.")
+
+
+def test_a_rule_statement_leads_to_its_moment(config, store):
+    """Before/after for a stated rule: the last request before the user's
+    message (rule signals carry no exchanges, only the message's item)."""
+    request = {"messages": [{"role": "system", "content": "agent"}, {"role": "user", "content": "Add lodash"}]}
+    items = [{"kind": "user", "content": "Add lodash"}, {"kind": "action", "step": 1, "exchange": 7},
+             {"kind": "user", "content": "Always use pnpm here, never npm."}]
+    payload = {"id": "r1", "session": "root", "type": "correction", "source": "user", "from": "rules",
+               "item": 2, "text": "Always use pnpm here, never npm.", "lesson": "x", "generality": "always"}
+    with store.connect() as db:
+        db.execute("INSERT INTO signals VALUES (?,?,?,?,?,NULL)", ("r1", store.model_id, "root", 1, json.dumps(payload)))
+    import songe.reading.timeline as timeline
+
+    original = (timeline.sessions, quick.reading.load_session)
+    timeline.sessions = lambda db, cutoff=None: {"root": [7]}
+    quick.reading.load_session = lambda store, ids: ([], items)
+    try:
+        with store.connect() as db:
+            db.execute("INSERT INTO exchanges(id,created,path,request,response,status,complete,binding) "
+                       "VALUES (7,0,'/v1/chat/completions',?,NULL,200,1,'b')", (json.dumps(request),))
+        found = quick.moment(store, {"signals": ["r1"]})
+    finally:
+        timeline.sessions, quick.reading.load_session = original
+    assert found["request"] == request and found["feedback"] == "Always use pnpm here, never npm."
+
+
+def test_old_rule_captures_are_checked_again(config, store):
+    payload = {"id": "r1", "session": "s", "type": "correction", "source": "user", "from": "rules",
+               "revision": 1, "text": "Please use the feedback from each guess.", "lesson": "x",
+               "short": "Please use the feedback from each guess.", "generality": "always"}
+    with store.connect() as db:
+        db.execute("INSERT INTO signals VALUES (?,?,?,?,?,NULL)", ("r1", store.model_id, "s", 1, json.dumps(payload)))
+    quick.quick_dream(store, config)
+    assert quick.active(store) == []
+
+
+async def test_compare_drops_streaming_and_length_settings():
+    sent = []
+
+    class Client:
+        async def post(self, url, json):
+            sent.append(json)
+
+            class R:
+                def raise_for_status(self):
+                    pass
+
+                def json(self):
+                    return {"choices": [{"message": {"content": "ok"}}]}
+            return R()
+
+    request = {"messages": [{"role": "user", "content": "hi"}], "stream": True,
+               "stream_options": {"include_usage": True}, "max_completion_tokens": 9000}
+    await quick.compare(Client(), "http://m/v1", "served", request, "", "")
+    assert "stream_options" not in sent[0] and "max_completion_tokens" not in sent[0]
+    assert sent[0]["max_tokens"] == quick.ANSWER_TOKENS
+
+
+def test_a_rule_replays_the_action_it_reacted_to():
+    items = [
+        {"kind": "user", "content": "Add the lodash package"},
+        {"kind": "action", "exchange": 1, "tool_calls": [{"name": "shell", "arguments": '{"command": "ls -la"}'}]},
+        {"kind": "action", "exchange": 2, "tool_calls": [{"name": "shell", "arguments": '{"command": "npm install lodash"}'}]},
+        {"kind": "action", "exchange": 3, "tool_calls": [{"name": "shell", "arguments": '{"command": "cat package.json"}'}]},
+        {"kind": "action", "exchange": 4, "text": "Done.", "tool_calls": []},
+    ]
+    assert quick.reacted_to(items, "Always use pnpm for packages here, never npm.") == 2
+    assert quick.reacted_to(items, "Always write tests with pytest, never unittest.") == 3  # latest tool call
+
+
+def test_status_says_it_is_reading_not_waiting_for_a_deep_dream(config, store):
+    from types import SimpleNamespace
+
+    from songe.status import activity
+
+    scheduler = SimpleNamespace(reason="Waiting for an idle gap", last_traffic=0.0, idle_threshold_seconds=10.0,
+                                reading_activity={"m": {"kind": "read", "done": 19, "total": 51}})
+    out = activity(config, store, scheduler, None, [], live=True)
+    assert out["now"] == "reading your conversations · 19 of 51"
+    assert out["next"].startswith("then the preferences in the prompt update · a Deep Dream after")
+
+
+def test_a_rule_about_scripts_replays_the_script_written_not_a_later_edit():
+    """Live demo: "always put my name and the date in the top of the script"
+    replayed a small edit of main() instead of the write of the script."""
+    script = "#!/usr/bin/env python3\n# 2048 game script\ndef main():\n    grid = new_grid()\n"
+    items = [
+        {"kind": "user", "content": "can you write a 2048 game for me"},
+        {"kind": "action", "exchange": 1, "tool_calls": [
+            {"name": "write", "arguments": json.dumps({"path": "2048.py", "content": script})}]},
+        {"kind": "action", "exchange": 2, "tool_calls": [
+            {"name": "edit", "arguments": json.dumps({"path": "2048.py", "oldText": "grid", "newText": "grid = new_grid()"})}]},
+    ]
+    assert quick.reacted_to(items, "always put my name and the date in the top of the script.") == 1
+
+
+def test_an_answer_cut_off_mid_file_still_shows_what_it_wrote():
+    message = {"tool_calls": [{"function": {"name": "write", "arguments":
+               '{"path": "2048.py", "content": "#!/usr/bin/env python3\\n# Frank Wu, 2026-11-19\\nimport ra'}}]}
+    (call,) = quick.answer_of(message)["tool_calls"]
+    assert call["arguments"] == {"path": "2048.py", "content": "#!/usr/bin/env python3\n# Frank Wu, 2026-11-19\nimport ra"}
+
+
+def test_a_reworded_preamble_before_the_same_call_is_not_a_change():
+    """Live demo: "provide the final working game" vs "provide a brief usage
+    note" before the same edit was shown as a before/after."""
+    edit = [{"name": "edit", "arguments": {"path": "2048.py", "newText": "main()"}}]
+    assert not quick.differs({"text": "I'll complete it and then provide the final working game.", "tool_calls": edit},
+                             {"text": "I'll complete main() and then provide a brief usage note.", "tool_calls": edit})
+    written = [{"name": "write", "arguments": {"path": "2048.py", "content": "# Frank Wu\nimport random"}}]
+    assert quick.differs({"text": "", "tool_calls": edit}, {"text": "", "tool_calls": written})
+    assert not quick.differs({"text": "Done, the tests pass.", "tool_calls": []}, {"text": "Done; the tests pass.", "tool_calls": []})
+    assert quick.differs({"text": "Done.", "tool_calls": []}, {"text": "I ran pytest first: 12 passed. Done.", "tool_calls": []})
+
+
+async def test_the_judge_says_which_answer_follows_the_lesson_whatever_the_order():
+    def client(says_new):
+        class Client:
+            async def post(self, url, json):
+                prompt = json["messages"][0]["content"]
+                a_is_new = prompt.index("pnpm add") < prompt.index("npm install")
+                letter = ("A" if a_is_new else "B") if says_new else ("B" if a_is_new else "A")
+
+                class R:
+                    def raise_for_status(self):
+                        pass
+
+                    def json(self):
+                        return {"choices": [{"message": {"content": '{"follows": "%s"}' % letter}}]}
+                return R()
+        return Client()
+
+    before = {"text": "", "tool_calls": [{"name": "shell", "arguments": {"command": "npm install lodash"}}]}
+    after = {"text": "", "tool_calls": [{"name": "shell", "arguments": {"command": "pnpm add lodash"}}]}
+    for lesson in ("Always use pnpm, never npm.", "Use pnpm here.", "pnpm only", "Never npm."):
+        assert await quick.judge(client(True), "http://m/v1", "served", lesson, before, after) == "after"
+        assert await quick.judge(client(False), "http://m/v1", "served", lesson, before, after) == "before"
+
+    class Broken:
+        async def post(self, url, json):
+            raise RuntimeError("server gone")
+    assert await quick.judge(Broken(), "http://m/v1", "served", "x", before, after) is None
+
+
+def test_a_stated_rule_carries_the_step_it_is_about_so_it_can_be_practiced():
+    items = [
+        {"kind": "user", "content": "Add lodash"},
+        {"kind": "action", "step": 1, "exchange": 11, "tool_calls": [{"name": "shell", "arguments": '{"command": "npm install lodash"}'}]},
+        {"kind": "user", "content": "Always use pnpm for packages here, never npm."},
+    ]
+    about = quick.reacted_action(items[:2], "Always use pnpm for packages here, never npm.")
+    assert (about["step"], about["exchange"]) == (1, 11)
+
+
+async def test_cancel_after_pause_leaves_nothing_paused(config, store):
+    """Live: Pause, then Cancel Dream; the button still said Resume."""
+    from types import SimpleNamespace
+
+    import httpx
+
+    from songe.proxy import create_app
+
+    async def cancel(model):
+        return True
+
+    app = create_app(config, store, scheduler=SimpleNamespace(cancel=cancel, interrupt=lambda *a: None, active_model=None))
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://localhost") as client:
+        await client.post("/api/control", json={"action": "pause"})
+        assert store.get("paused") is True
+        done = (await client.post("/api/control", json={"action": "cancel"})).json()
+    assert done["ok"] and "next Deep Dream" in done["message"] and store.get("paused") is False
+
+
+def test_what_the_user_sees_of_an_answer():
+    assert quick.visible("I should check.\n</think>\nLet me look.\n<tool_call>\n<function=read>") == "Let me look."
+    assert quick.visible("<think>hmm</think>Done.") == "Done."
+    assert quick.visible("Plain answer.") == "Plain answer."
+
+
+def test_a_deep_dream_example_shows_only_if_the_action_differs():
+    """Live: two "let me check the directory structure" answers, scored
+    better, were shown as a before/after."""
+    from songe.cycle import shown_examples
+
+    def ex(i, before, after):
+        return {"id": str(i), "improved": True, "verdict": "after", "source": "original", "teacher_preference": 1.0,
+                "signal": {"id": f"s{i}", "source": "user"},
+                "before": {"text": before, "tool_calls": []}, "after": {"text": after, "tool_calls": []}}
+    same = ex(1, "The path might be wrong.\n</think>\nLet me check the directory structure.",
+              "The write failed.\n</think>\nLet me check the directory structure.")
+    prose = ex(2, "Here is the README with a table of options.", "Here is the README; options are listed as bullets.")
+    real = ex(3, "", "")
+    real["before"]["tool_calls"] = [{"name": "edit", "arguments": {"path": "cli.py", "newText": "polygon_perimeter"}}]
+    real["after"]["tool_calls"] = [{"name": "read", "arguments": {"path": "cli.py"}}]
+    cut = ex(4, "I'll edit it.\n<tool_call>\n<function=edit>\n<parameter=path>", "")
+    cut["after"]["tool_calls"] = [{"name": "read", "arguments": {"path": "README.md"}}]
+    # Prose only, or one side's call cut off mid-way: not shown.
+    assert [e["id"] for e in shown_examples([same, prose, real, cut])] == ["3"]

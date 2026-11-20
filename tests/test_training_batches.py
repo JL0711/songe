@@ -1,0 +1,520 @@
+"""Optimizer invariants, using CPU tensors and framework-free MLX stand-ins."""
+
+import json
+import sys
+from dataclasses import replace
+from pathlib import Path
+from types import SimpleNamespace
+
+import pytest
+
+from songe.backends.training import train
+from songe.memory import Snapshot
+from songe.sleep.calibrate import derive
+from songe.sleep.sizing import choose_size, cost_model, predict
+from songe.storage import private_dir, write_json
+from tests.test_data_cycles import ScalarBackend
+
+
+def measurements():
+    return [
+        dict(
+            sequence=n,
+            response_tokens=r,
+            token_chunk=c,
+            accumulation=b,
+            host_peak_bytes=1000 + 10 * n + r + c + 100 * (b > 1),
+            device_peak_bytes=0,
+            step_seconds=b,
+        )
+        for n in (64, 512)
+        for r in (1, 32)
+        for c in (1, 32)
+        for b in (1, 4)
+    ]
+
+
+def test_memory_changes_microbatch_geometry_without_changing_optimizer_batch(
+    config, monkeypatch
+):
+    # Isolates the boundary logic from the fixed 10% RAM reserve.
+    monkeypatch.setattr("songe.sleep.sizing.RAM_RESERVE_FRACTION", 0)
+    config = replace(config, max_sequence=512, response_tokens=32, accumulation=7)
+    rows = measurements()
+    large = choose_size(config, {"rows": rows}, Snapshot(10000, 10000), {})
+    small = choose_size(config, {"rows": rows}, Snapshot(10000, 2500), {})
+    assert large["max_sequence"] > small["max_sequence"]
+    assert large["accumulation"] == small["accumulation"] == 7
+    for resource in ("host", "device"):
+        model = cost_model(rows, resource + "_peak_bytes")
+        assert predict(model, (128, 16, 1, 1)) == predict(model, (128, 16, 1, 1000))
+    assert derive(rows, 1, accumulation=7)["accumulation"] == 7
+
+
+@pytest.mark.parametrize("kind", ["torch", "mlx"])
+@pytest.mark.parametrize("splits", [(1, 3, 2), (2, 2, 2), (6,)])
+def test_token_normalization_is_independent_of_microbatch_splits(
+    config, tmp_path, monkeypatch, kind, splits
+):
+    # The same six token derivatives are partitioned differently within one
+    # optimizer unit. A second, partial unit has a single token.
+    values = [0.1, 0.2, 0.3, 0.4, 0.5, 0.6]
+    pool, offset = [], 0
+    for index, count in enumerate(splits):
+        pool.append({"id": str(index), "values": values[offset : offset + count]})
+        offset += count
+    pool.append({"id": "partial", "values": [0.8]})
+    backend = ScalarBackend(replace(config, accumulation=len(splits)), [0])
+    if kind == "mlx":
+
+        def tree_map(fn, *trees):
+            return {key: fn(*(tree[key] for tree in trees)) for key in trees[0]}
+
+        monkeypatch.setitem(
+            sys.modules,
+            "mlx.utils",
+            SimpleNamespace(
+                tree_map=tree_map,
+                tree_flatten=lambda tree: list(tree.items()),
+                tree_unflatten=dict,
+            ),
+        )
+        backend.kind = "mlx"
+        backend.mx = SimpleNamespace(
+            eval=lambda *args: None,
+            save_safetensors=lambda path, value: write_json(Path(path), value),
+            load=lambda path: json.loads(path.read_text(encoding="utf-8")),
+        )
+        backend.optim = SimpleNamespace(clip_grad_norm=lambda grads, **kw: (grads, 0.0))
+        backend.optimizer = lambda schedule: SimpleNamespace(state={})
+
+    def microbatch(step, optimizer, seed):
+        tokens = len(step["values"])
+        mean = sum(step["values"]) / tokens
+        return mean, {"weight": mean}, tokens
+
+    backend.train_step = microbatch
+    result = train(backend, pool, [], private_dir(tmp_path / "work"), lambda *_: None)
+    if len(splits) == 1:
+        # With a one-sample optimizer unit the final sample is another full unit.
+        assert result["iterations"] == 2
+    assert backend.gradients == pytest.approx([0.35, 0.8])
+    assert result["loss"] == pytest.approx(0.8)
+    assert result["steps_learned"] == len(pool)
+
+
+@pytest.mark.parametrize("resource", ["host", "device"])
+def test_never_fit_uses_smallest_chunk_and_total_machine_capacity(
+    config, store, resource
+):
+    from songe.sleep.samples import SampleAdmission
+    from tests.test_learning import Tokenizer
+
+    config = replace(config, max_sequence=512, response_tokens=32)
+    rows = measurements()
+    if resource == "device":
+        for row in rows:
+            row["device_peak_bytes"] = row["host_peak_bytes"]
+            row["host_peak_bytes"] = 0
+    step = {
+        "id": "long",
+        "source_id": 1,
+        "split": "train",
+        "context": [{"role": "user", "content": "x" * 200}],
+        "hindsight": [],
+    }
+    memory = {"total": 10000, "vram": []}
+    if resource == "host":
+        memory["total"] = 2500
+    else:
+        memory["vram"] = [{"memory_total": 2500}]
+    slice_id = store.slice()
+    admission = SampleAdmission(
+        config,
+        {"max_sequence": 512, "memory": memory},
+        {"rows": rows},
+        store,
+        slice_id,
+    )
+    # Without a total-capacity verdict the gradient window simply trains.
+    roomy = SampleAdmission(
+        config, {"max_sequence": 512}, {"rows": rows}, store, slice_id
+    )
+    assert roomy.admit([step], Tokenizer()) == [step]
+    assert not store.get("unfit_samples")
+    assert admission.admit([step], Tokenizer()) == []
+    assert resource in next(iter(store.get("unfit_samples").values()))[
+        "reason"
+    ].lower().replace("ram", "host")
+    saved = store.get("unfit_samples")
+    again = SampleAdmission(
+        config,
+        {"max_sequence": 128, "memory": memory},
+        {"rows": rows},
+        store,
+        store.slice(),
+    )
+
+    class NoRetry(Tokenizer):
+        def apply_chat_template(self, *args, **kwargs):
+            pytest.fail("A known unfit revision must not be rendered again")
+
+    assert again.admit([step], NoRetry()) == []
+    assert store.get("unfit_samples") == saved
+    assert again.record["unfit_samples"] == []
+
+
+HEAD = [[0.3, -0.2, 0.7], [-0.4, 0.8, 0.1]]
+
+STEP = {
+    "context": [
+        {"role": "system", "content": "Rules"},
+        {"role": "user", "content": "Old question"},
+        {
+            "role": "assistant",
+            "tool_calls": [{"id": "t", "function": {"name": "read", "arguments": {}}}],
+        },
+        {"role": "tool", "tool_call_id": "t", "content": "OLD TOOL OUTPUT"},
+        {"role": "user", "content": "Recent question"},
+        {"role": "assistant", "content": "Historical answer"},
+        {"role": "user", "content": "Question"},
+    ],
+    "hindsight": [{"role": "user", "content": "Correct answer"}],
+}
+
+
+def cpu_backend(kind, config, monkeypatch):
+    """A production MLX or Torch backend over a positional stand-in trunk.
+
+    Hidden states depend on every earlier token (a cumulative sum), so a
+    prefix read into a cache must give the same forward as a full pass. The
+    adapter weight moves only student states; base and teacher are frozen.
+    Each trunk call records (mode, full sequence, tokens read in this call)."""
+    import contextlib
+
+    import numpy as np
+
+    from songe.backends.mlx import Backend as MLXBackend
+    from songe.backends.torch import TorchBackend
+    from tests.test_learning import NumpyAPI, Tokenizer
+
+    torch = pytest.importorskip("torch")
+    cls = MLXBackend if kind == "mlx" else TorchBackend
+    backend = cls.__new__(cls)
+    backend.config, backend.tokenizer = config, Tokenizer()
+    backend.check = lambda: None
+    backend.sample = lambda prompt, seed: (
+        [7] if seed == 1 else [7, 8, 9, 10],
+        "",
+        None,
+    )
+    backend.modes, backend.sequences, backend.entered = ["student"], [], []
+
+    @contextlib.contextmanager
+    def mode(name):
+        backend.modes.append(name)
+        backend.entered.append(name)
+        try:
+            yield
+        finally:
+            backend.modes.pop()
+
+    backend.base = lambda: mode("base")
+    backend.mode = mode
+    head = np.array(HEAD, dtype=np.float32)
+
+    def positional(ids, skip):
+        backend.sequences.append((backend.modes[-1], list(ids), len(ids) - skip))
+        position = np.cumsum(np.array(ids, dtype=np.float32)) / 1000
+        value = np.stack([np.sin(position), np.cos(position)], axis=-1)[None]
+        direction = np.stack([np.cos(position), -np.sin(position)], axis=-1)[None]
+        if kind == "torch":
+            value, direction = torch.from_numpy(value), torch.from_numpy(direction)
+        weight = backend.model.weight if backend.modes[-1] == "student" else 0
+        return (value + weight * direction)[:, skip:]
+
+    if kind == "torch":
+        backend.torch, backend.device, backend.trainable = (
+            torch,
+            torch.device("cpu"),
+            True,
+        )
+        backend.model = torch.nn.Module()
+        backend.model.weight = torch.nn.Parameter(torch.tensor(0.2))
+        backend.head = lambda hidden: hidden @ torch.from_numpy(head)
+
+        def base_model(input_ids, past_key_values=None, use_cache=False, **kwargs):
+            prefix = list(past_key_values or [])
+            ids = prefix + input_ids[0].tolist()
+            return SimpleNamespace(
+                last_hidden_state=positional(ids, len(prefix)),
+                past_key_values=ids if use_cache else None,
+            )
+
+        backend._causal = lambda: SimpleNamespace(base_model=base_model)
+        return backend
+
+    class KVCache:
+        def __init__(self):
+            self.keys = self.values = None
+            self.offset = 0
+
+        def update_and_fetch(self, keys, values):
+            if self.keys is not None:
+                keys = np.concatenate([self.keys, keys], axis=2)
+                values = np.concatenate([self.values, values], axis=2)
+            self.keys, self.values = keys, values
+            self.offset = keys.shape[2]
+            return keys, values
+
+        @property
+        def state(self):
+            return self.keys, self.values
+
+    monkeypatch.setitem(
+        sys.modules,
+        "mlx_lm.models.cache",
+        SimpleNamespace(
+            KVCache=KVCache,
+            ArraysCache=type("ArraysCache", (), {}),
+            make_prompt_cache=lambda model: [KVCache()],
+        ),
+    )
+
+    class CPUArrays(NumpyAPI):
+        array = staticmethod(np.array)
+        checkpoint = staticmethod(lambda fn: fn)
+        eval = staticmethod(lambda *args: None)
+
+    backend.mx = CPUArrays
+    backend.model = SimpleNamespace(
+        weight=0.2, training=False, train=lambda *a: None, eval=lambda: None
+    )
+    backend.head = lambda hidden: hidden @ head
+
+    def trunk(ids, cache=None):
+        new = np.asarray(ids, dtype=np.float32).reshape(1, 1, -1, 1)
+        if cache is None:
+            return positional(new.reshape(-1).astype(int).tolist(), 0)
+        keys, _ = cache[0].update_and_fetch(new, new)
+        return positional(
+            keys.reshape(-1).astype(int).tolist(), keys.shape[2] - new.shape[2]
+        )
+
+    backend._text_model = lambda: SimpleNamespace(model=trunk)
+
+    def value_and_grad(model, fn):
+        def evaluate(model):
+            weight, epsilon = model.weight, 0.005
+            value = fn(model)
+            model.weight = weight + epsilon
+            plus = fn(model)
+            model.weight = weight - epsilon
+            minus = fn(model)
+            model.weight = weight
+            return value, {"weight": (plus - minus) / (2 * epsilon)}
+
+        return evaluate
+
+    backend.nn = SimpleNamespace(value_and_grad=value_and_grad)
+    return backend
+
+
+def run_steps(backend, step=STEP):
+    loss, gradient, tokens = 0, 0, 0
+    for seed in (1, 2):
+        value, grad, count = backend.train_step(step, None, seed=seed)
+        assert count == (1 if seed == 1 else 4)
+        loss += value * count
+        gradient += float(grad["weight"]) * count
+        tokens += count
+    return loss / tokens, gradient / tokens
+
+
+@pytest.mark.parametrize("chunk", [1, 3])
+def test_mlx_and_torch_training_token_counts_losses_and_gradients_match_on_cpu(
+    config, monkeypatch, chunk
+):
+    """Execute both production loss paths; MLX's array API uses NumPy on CPU."""
+    from songe.sleep.prompts import paired_prompts
+
+    config = replace(config, token_chunk=chunk, response_tokens=4, teacher_chunk=4096)
+    student, teacher = paired_prompts(
+        cpu_backend("torch", config, monkeypatch).tokenizer, STEP, config
+    )
+    # The student reads the exact context; the teacher adds only hindsight.
+    assert b"OLD TOOL OUTPUT" in bytes(student)
+    assert bytes(teacher).startswith(bytes(student)[: bytes(student).rindex(b"]")])
+    assert b"Correct answer" in bytes(teacher) and b"Correct answer" not in bytes(
+        student
+    )
+    assert b"Respond now with your own action." in bytes(teacher)
+    results = []
+    for kind in ("mlx", "torch"):
+        backend = cpu_backend(kind, config, monkeypatch)
+        results.append(run_steps(backend))
+        # Without a cycle snapshot the teacher is the frozen base, over the full
+        # teacher prompt; the student's gradient pass covers the whole context.
+        assert ("base", teacher, len(teacher)) in backend.sequences
+        assert ("student", student, len(student)) in backend.sequences
+        assert all(
+            mode != "student" or skip == len(ids)
+            for mode, ids, skip in backend.sequences
+        )
+    assert results[0][0] > 0 and abs(results[0][1]) > 1e-4
+    assert results[0][0] == pytest.approx(results[1][0], abs=1e-6)
+    assert results[0][1] == pytest.approx(results[1][1], abs=2e-5, rel=0.002)
+
+
+@pytest.mark.parametrize("kind", ["mlx", "torch"])
+def test_gradient_covers_context_tail_and_reads_earlier_context_frozen(
+    config, monkeypatch, kind
+):
+    from songe.sleep.prompts import paired_prompts
+
+    full = replace(config, token_chunk=3, response_tokens=4, teacher_chunk=4096)
+    student, _ = paired_prompts(
+        cpu_backend(kind, full, monkeypatch).tokenizer, STEP, full
+    )
+    expected = run_steps(cpu_backend(kind, full, monkeypatch))
+    window = 60
+    config = replace(full, max_sequence=window, teacher_chunk=64)
+    backend = cpu_backend(kind, config, monkeypatch)
+    # The forward is exact; this stand-in's gradient has no far-context term.
+    assert run_steps(backend) == pytest.approx(expected, abs=1e-6, rel=1e-5)
+    for seed, y in ((1, [7]), (2, [7, 8, 9, 10])):
+        backend.sequences.clear()
+        backend.train_step(STEP, None, seed=seed)
+        students = [
+            (ids, read) for mode, ids, read in backend.sequences if mode == "student"
+        ]
+        split = len(student) - (window - len(y))
+        tail = student[split:] + y[:-1]
+        # The gradient pass reads only the context tail plus response, on top
+        # of the frozen state: together they fill the window exactly.
+        gradient = (student[:split] + tail, len(tail))
+        assert len(tail) + 1 == window and gradient in students
+        # The earlier context is read once, with no gradient, in teacher_chunk pieces.
+        prefix = [s for s in students if s != gradient]
+        ends = list(range(64, split, 64)) + [split]
+        assert prefix == [
+            (student[:end], end - start)
+            for start, end in zip([0] + ends, ends, strict=False)
+        ]
+
+
+@pytest.mark.parametrize("kind", ["mlx", "torch"])
+def test_hindsight_steps_use_cycle_teacher_and_anchors_use_base(
+    config, monkeypatch, kind
+):
+    from songe.sleep.prompts import paired_prompts
+
+    config = replace(config, token_chunk=3, response_tokens=4, teacher_chunk=4096)
+    backend = cpu_backend(kind, config, monkeypatch)
+    backend.teacher = lambda: backend.mode("teacher")
+    run_steps(backend)
+    student, teacher = paired_prompts(backend.tokenizer, STEP, config)
+    assert ("teacher", teacher, len(teacher)) in backend.sequences
+    assert not any(
+        mode == "base" and len(ids) >= len(student)
+        for mode, ids, _ in backend.sequences
+    )
+    assert backend.entered.count("teacher") == 2
+    anchor = {
+        "context": [{"role": "user", "content": "General prompt"}],
+        "hindsight": [],
+    }
+    backend = cpu_backend(kind, config, monkeypatch)
+    backend.teacher = lambda: pytest.fail("Anchors keep the original base as teacher")
+    run_steps(backend, anchor)
+    prompt, same = paired_prompts(backend.tokenizer, anchor, config)
+    assert prompt == same
+    assert ("base", prompt, len(prompt)) in backend.sequences
+    assert "teacher" not in backend.entered
+
+
+def test_torch_teacher_is_the_cycle_start_snapshot():
+    import contextlib
+
+    from songe.backends.torch import TorchBackend
+
+    torch = pytest.importorskip("torch")
+    backend = TorchBackend.__new__(TorchBackend)
+    backend.torch = torch
+    backend.model = torch.nn.Linear(2, 1)
+    backend.model.bias.requires_grad_(False)
+    based = []
+
+    @contextlib.contextmanager
+    def base():
+        based.append(True)
+        yield
+
+    backend.base = base
+    with backend.teacher():
+        pass
+    assert based == [True]  # No snapshot: the original base teaches (cycle 1).
+    backend.model.weight.data[:] = torch.tensor([[1.0, 2.0]])
+    backend.snapshot_teacher()
+    assert set(backend.teacher_weights) == {"weight"}
+    backend.model.weight.data[:] = torch.tensor([[5.0, 6.0]])  # training moved on
+    backend.model.train()
+    with backend.teacher():
+        assert backend.model.weight.tolist() == [[1.0, 2.0]]
+        assert not backend.model.training
+    assert backend.model.weight.tolist() == [[5.0, 6.0]]
+    assert backend.model.training and based == [True]
+
+
+def test_mlx_teacher_is_the_cycle_start_snapshot(monkeypatch):
+    import contextlib
+
+    import numpy as np
+
+    from songe.backends.mlx import Backend
+
+    monkeypatch.setitem(
+        sys.modules,
+        "mlx.utils",
+        SimpleNamespace(tree_flatten=lambda tree: list(tree.items())),
+    )
+
+    class Model:
+        training = True
+        weights = {"lora_a": np.array([1.0, 2.0])}
+
+        def trainable_parameters(self):
+            return dict(self.weights)
+
+        def load_weights(self, items, strict=True):
+            assert strict is False
+            self.weights = dict(items)
+
+        def train(self, mode=True):
+            self.training = mode
+
+        def eval(self):
+            self.training = False
+
+    backend = Backend.__new__(Backend)
+    backend.mx = SimpleNamespace(array=np.array)
+    backend.model = Model()
+    based = []
+
+    @contextlib.contextmanager
+    def base():
+        based.append(True)
+        yield
+
+    backend.base = base
+    with backend.teacher():
+        pass
+    assert based == [True]
+    backend.snapshot_teacher()
+    backend.model.weights["lora_a"][:] = [5.0, 6.0]  # training moved on in place
+    backend.model.weights = {"lora_a": np.array([7.0, 8.0])}
+    with backend.teacher():
+        assert backend.model.weights["lora_a"].tolist() == [1.0, 2.0]
+        assert not backend.model.training
+    assert backend.model.weights["lora_a"].tolist() == [7.0, 8.0]
+    assert backend.model.training and based == [True]

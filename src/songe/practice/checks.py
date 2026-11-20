@@ -1,0 +1,171 @@
+"""Checks a practice scene must pass to be trained on (ported from
+scripts/dream/validate.py). Nothing in a scene is ever run: files are only
+parsed.
+
+- built: the frame rendered every step (real tools, valid arguments, files
+  that exist, edits that apply)
+- decision: the scene ends where the agent must act (a user message or a
+  tool result is last)
+- parses: made-up Python and JSON files parse
+- not_copy: no function names or request wording shared with the real
+  session it came from (a shared file name alone is not a copy)
+- matters: shown the scene and two lessons, its own and one from another
+  session, the model picks its own. Asked about a single lesson, the model
+  said yes to every scene; the forced choice is what made the check informative.
+
+Drop codes are the first failed check, in this order (docs/CONTRACTS.md).
+"""
+
+import ast
+import hashlib
+import json
+import re
+
+from ..reading.timeline import clip
+
+GENERIC_NAMES = {"main", "test", "run", "parse", "load", "init", "__init__", "setup", "helper"}
+
+MATTERS_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "why": {"type": "string"},
+        "answer": {"type": "string", "enum": ["A", "B", "neither"]},
+    },
+    "required": ["why", "answer"],
+}
+
+MATTERS = """Here is a practice situation for a coding agent. It stops where the agent must choose its next action.
+
+{dream}
+
+Two lessons:
+A: {a}
+B: {b}
+
+Which lesson is about the agent's next action in this situation? Answer "neither" if neither applies.
+Answer with JSON: why (one sentence), then answer (A, B or neither)."""
+
+ORDER = ("built", "decision", "parses", "not_copy", "matters")
+
+
+def render_text(messages, limit=4000):
+    """The scene as the agent would see it, minus the system prompt."""
+    out = []
+    for m in (messages or [])[1:]:
+        if m["role"] == "user":
+            out.append(f"USER: {m['content']}")
+        elif m["role"] == "assistant":
+            for c in m.get("tool_calls") or []:
+                args = json.loads(c["function"]["arguments"] or "{}")
+                shown = ", ".join(f"{k}={clip(str(v), 300)!r}" for k, v in args.items())
+                out.append(
+                    f"AGENT: {m['content'] or ''}\n  calls {c['function']['name']}({shown})".replace(
+                        "AGENT: \n", "AGENT:\n"
+                    )
+                )
+            if not m.get("tool_calls"):
+                out.append(f"AGENT: {m['content'] or ''}")
+        elif m["role"] == "tool":
+            out.append(f"  result: {clip(m['content'], 600)}")
+    out.append("(the agent acts next)")
+    return clip("\n".join(out), limit)
+
+
+def words(text):
+    return set(re.findall(r"[a-z_][a-z0-9_]{2,}", (text or "").lower()))
+
+
+def trigrams(text):
+    w = re.findall(r"[a-z0-9_]+", (text or "").lower())
+    return {tuple(w[i : i + 3]) for i in range(len(w) - 2)}
+
+
+def jaccard(a, b):
+    return len(a & b) / len(a | b) if a | b else 0.0
+
+
+def identifiers(texts):
+    """Function and class names defined in some code."""
+    names = set()
+    for text in texts:
+        names.update(
+            re.findall(r"(?:def|function|fn|class|struct)\s+([A-Za-z_]\w*)", text or "")
+        )
+    return names - GENERIC_NAMES
+
+
+def parse_error(path, text):
+    """None when the file parses or is not a kind we check (Python, JSON)."""
+    if path.endswith(".py"):
+        try:
+            ast.parse(text)
+        except SyntaxError as e:
+            return f"{path}: {e.msg} (line {e.lineno})"
+    elif path.endswith(".json"):
+        try:
+            json.loads(text)
+        except ValueError as e:
+            return f"{path}: {e}"
+    return None
+
+
+def source_of(items):
+    """What the real session showed: its user requests and every bit of code
+    the agent read or wrote, for the copy check."""
+    requests = [it["content"] for it in items if it["kind"] == "user"]
+    code = [it["content"] for it in items if it["kind"] == "tool_result"]
+    for it in items:
+        for c in it.get("tool_calls") or []:
+            code.append(c.get("arguments") or "")
+    return requests, code
+
+
+def copy_evidence(scene, files, requests, code):
+    shared = identifiers(code) & (identifiers(files.values()) | words(scene.get("request")))
+    # Against each user message on its own: joining them dilutes a copy.
+    asked = trigrams(scene.get("request"))
+    overlap = max((jaccard(trigrams(r), asked) for r in requests), default=0.0)
+    return sorted(shared) + ([f"request overlap {overlap:.2f}"] if overlap > 0.3 else [])
+
+
+def placebo_for(practice_id, signal, lessons):
+    """A lesson from another session, picked the same way every time, and
+    whether the real lesson is shown first."""
+    others = sorted({lesson for session, lesson in lessons if session != signal["session"]})
+    h = int(hashlib.sha256(practice_id.encode()).hexdigest(), 16)
+    return (others[h % len(others)] if others else None), h % 2 == 0
+
+
+async def check(row, signal, items, reader, lessons):
+    """The check results of one scene, its drop code (None when kept) and why."""
+    scene, c = row["scene"], {}
+    c["built"] = "error" not in scene and not row.get("problems")
+    messages = row.get("messages") or []
+    c["decision"] = bool(messages) and messages[-1]["role"] in ("user", "tool")
+    files = {f["path"]: f["content"] for f in scene.get("files") or [] if isinstance(f, dict)}
+    files.update(row.get("final_files") or {})
+    errors = [e for p, t in files.items() if (e := parse_error(p, t or ""))]
+    c["parses"] = not errors
+    requests, code = source_of(items)
+    evidence = copy_evidence(scene, files, requests, code) if c["built"] else []
+    c["not_copy"] = not evidence
+    c["matters"] = None
+    why = {"parse_errors": errors, "copy_evidence": evidence}
+    if all(c[k] for k in ORDER[:4]):
+        placebo, real_first = placebo_for(row["id"], signal, lessons)
+        if placebo:
+            real = signal["lesson"]
+            a, b = (real, placebo) if real_first else (placebo, real)
+            answer = await reader.ask(
+                MATTERS.format(dream=render_text(messages, limit=2500), a=a, b=b),
+                MATTERS_SCHEMA,
+                "matters",
+                max_tokens=600,
+            )
+            c["matters"] = answer.get("answer") == ("A" if real_first else "B")
+            why["matters_answer"] = (
+                "real" if c["matters"] else "neither" if answer.get("answer") == "neither" else "placebo"
+            )
+            why["matters_why"] = answer.get("why")
+    drop = next((k for k in ORDER if c[k] is False), None)
+    return c, drop, why

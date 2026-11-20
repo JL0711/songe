@@ -1,0 +1,946 @@
+"""Multi-model regressions: fake runtimes, temporary files, no training/server."""
+
+import json
+import sqlite3
+from types import SimpleNamespace
+
+import httpx
+import pytest
+
+from songe.api import LocalClient, snapshot
+from songe.config import Config, training_fingerprint
+from songe.log import SCHEMA, SCHEMA_V2, Store
+from songe.models import ModelRef, registry
+from songe.proxy import create_app
+from songe.schedule import ModelScheduler
+from songe.sleep.select import select
+from tests.test_proxy import Chunks
+from tests.test_store import version
+
+
+@pytest.fixture
+def learners(config, store):
+    config.model_ref = {
+        "upstream": config.upstream,
+        "serving_id": "first",
+        "format": "safetensors",
+        "path": config.model,
+        "architecture": "fixture",
+    }
+    config.base_identifier = "first"
+    config.calibration_available = True
+    config.save(store.root)
+    store.add_version(version("base"))
+    store.swap("base", None)
+    registry.migrate(config, store)
+    ref = ModelRef(
+        config.upstream, "second", "safetensors", store.root / "second", "fixture"
+    )
+    registry.register(config, store, "second", ref)
+    registry.support(store, "second", "trainable")
+    # These regressions exercise shared hindsight, explicitly selected now.
+    for model in ("first", "second"):
+        registry.set_learning(store, model, "all")
+    return config, store
+
+
+def evidence(count=5):
+    return [
+        {
+            "id": str(i),
+            "conversation": f"task-{i}",
+            "split": "train",
+            "source_id": i,
+            "context": [{"role": "user", "content": "question"}],
+            "tools": [],
+            "hindsight": [{"role": "user", "content": "correction"}],
+        }
+        for i in range(1, count + 1)
+    ]
+
+
+async def test_proxy_follows_second_model_and_off_only_forwards(learners, monkeypatch):
+    from songe import memory
+
+    config, store = learners
+    seen = []
+    monkeypatch.setattr(
+        memory, "guarded_run", lambda *a, **kw: SimpleNamespace(returncode=0)
+    )
+
+    async def handle(request):
+        seen.append(json.loads(request.content))
+        return httpx.Response(
+            200,
+            stream=Chunks(
+                [
+                    json.dumps(
+                        {
+                            "choices": [
+                                {"message": {"role": "assistant", "content": "ok"}}
+                            ]
+                        }
+                    ).encode()
+                ]
+            ),
+        )
+
+    second = store.scoped("second")
+    second.add_version(version("night-2", 2) | {"identifier": "second-learned"})
+    second.swap("night-2", second.get("current"))
+    wire = httpx.AsyncClient(transport=httpx.MockTransport(handle))
+    app = create_app(config, store, client=wire)
+    async with app.router.lifespan_context(app):
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app), base_url="http://localhost"
+        ) as client:
+            for model in (config.public_model, "second", "third"):
+                assert (
+                    await client.post(
+                        "/v1/chat/completions", json={"model": model, "messages": []}
+                    )
+                ).status_code == 200
+            assert seen[0]["model"] == "base"
+            assert seen[1]["model"] == "second-learned"
+            assert seen[2]["model"] == "third"
+            assert registry.find(store, "third")["enabled"] is True
+            response = await client.post(
+                "/api/control",
+                json={"action": "model", "model": "second", "enabled": False},
+            )
+            assert response.status_code == 200
+            await client.post(
+                "/v1/chat/completions", json={"model": "second", "messages": []}
+            )
+            assert seen[-1]["model"] == "second"
+            assert second.get("current") == "night-2"
+            assert (
+                await client.post(
+                    "/api/control",
+                    json={"action": "model", "model": "second", "enabled": True},
+                )
+            ).status_code == 200
+            await client.post(
+                "/v1/chat/completions", json={"model": "second", "messages": []}
+            )
+            assert seen[-1]["model"] == "second-learned"
+    await wire.aclose()
+    assert len(store.exchanges()) == 5  # Includes the request made while off.
+
+
+def test_shared_experience_is_selected_again_for_new_model(learners):
+    config, store = learners
+    steps = evidence()
+    store.sync_steps(steps)
+    first = store.scoped("first")
+    first.mark_scored(steps)
+    first.set("experience_watermark", 5)
+    first.add_pool([s | {"surprise": 1} for s in steps])
+    second = store.scoped("second")
+    assert first.experience_counts()[2] == 0
+    assert second.experience_counts()[2] == 5
+    assert second.pool() == []
+    selected, _ = select(second.unscored(second.active_steps("train")))
+    assert [s["id"] for s in selected] == [s["id"] for s in steps]
+    second.add_pool(selected)
+    second.mark_scored(steps)
+    # Each model keeps its own pool rows over the one shared evidence log.
+    assert first.pool()[0]["surprise"] == 1
+    assert [s["id"] for s in second.pool()] == [s["id"] for s in steps]
+    assert first.experience_counts()[2] == second.experience_counts()[2] == 0
+    with store.connect() as db:
+        assert db.execute("SELECT COUNT(*) FROM steps").fetchone()[0] == 5
+    heldout = evidence(1)[0] | {"id": "held", "split": "heldout"}
+    store.sync_steps([heldout])
+    assert first.active_steps("heldout") == second.active_steps("heldout")
+    with pytest.raises(ValueError, match="training conversations"):
+        second.add_pool([heldout | {"surprise": 2}])
+
+
+def test_a_rebuild_without_data_is_not_work(learners):
+    config, store = learners
+    scheduler = ModelScheduler(
+        config, store, SimpleNamespace(), platform=SimpleNamespace()
+    )
+    for model in ("first", "second"):
+        registry.support(store, model, "trainable")
+    assert scheduler.choose_model() is None
+    # After forget there is nothing left to rebuild from: it waits for
+    # conversations instead of counting quiet time toward a start.
+    store.scoped("first").set("rebuild_required", True)
+    assert scheduler.choose_model() is None
+    # With enough recorded, the rebuild is the next work.
+    store.sync_steps(evidence())
+    store.scoped("first").mark_scored(evidence())
+    store.scoped("second").mark_scored(evidence())
+    assert scheduler.choose_model() is None
+    policy = scheduler.config_for("first")
+    policy.min_train = 1
+    scheduler.config_for = lambda model: policy
+    assert scheduler.choose_model() == "first"
+
+
+async def test_dream_says_what_is_missing_and_the_asked_model_goes_first(
+    learners, monkeypatch
+):
+    import songe.schedule as schedule
+
+    config, store = learners
+    scheduler = ModelScheduler(
+        config, store, SimpleNamespace(), platform=SimpleNamespace()
+    )
+    for model in ("first", "second"):
+        registry.support(store, model, "trainable")
+    probes = schedule.Probes(available=True, thermal=0, power=schedule.Power(ac=True))
+    monkeypatch.setattr(schedule, "probe", lambda platform=None: probes)
+    wait = await scheduler.training_wait("first")
+    assert wait.startswith("needs ") and wait.endswith(" more examples")
+    store.set("paused", True)
+    assert scheduler.dream_blocked("first") == "learning is paused"
+    store.set("paused", False)
+    registry.set_learning(store, "second", "off")
+    assert scheduler.dream_blocked("second") == "learning is off for this model"
+    registry.set_learning(store, "second", "new")
+    scheduler.in_flight = {"request": 1}
+    assert scheduler.dream_blocked("first") == "the model is in use"
+    assert (await scheduler.dream("first")) == {
+        "started": False,
+        "message": "Not yet · the model is in use",
+    }
+    scheduler.in_flight = {}
+    assert scheduler.dream_blocked("first") is None
+    # With nothing recorded there is nothing to read, and training says why.
+    reply = await scheduler.dream("first")
+    assert not reply["started"] and store.get("requested_sleep") is not True
+    assert reply["message"].startswith("Nothing to read yet · training: needs ")
+    # A leftover memory wait with no request pending does not block a press
+    # (live: every press answered "already running"); a pending request does.
+    store.scoped("first").set("memory_wait", {"try": 1, "tries": 3, "available": 1, "total": 2})
+    reply = await scheduler.dream("first")
+    assert not reply["message"].startswith("A Deep Dream is already running")
+    store.set("requested_model", "first")
+    reply = await scheduler.dream("first")
+    assert reply == {"started": False, "message": reply["message"]} and reply["message"].startswith(
+        "A Deep Dream is already running · ")
+    store.set("requested_model", None)
+    store.scoped("first").set("memory_wait", None)
+    # Measuring is the first step of learning: nothing else is waited on.
+    for model in ("first", "second"):
+        registry.support(store, model, "pending", "calibration required")
+    assert await scheduler.training_wait("second") is None
+    probes = schedule.Probes(
+        available=True, thermal=0, power=schedule.Power(ac=False, fraction=0.05)
+    )
+    assert await scheduler.training_wait("second") == "battery low"
+    # Both have work; the one asked for is chosen.
+    assert scheduler.choose_model() == "first"
+    store.set("requested_model", "second")
+    assert scheduler.choose_model() == "second"
+    assert store.scoped("second").get("requested_model") == "second"  # shared
+
+
+async def test_dream_reads_replies_now_however_few(learners, monkeypatch):
+    import songe.review
+    import songe.schedule as schedule
+
+    config, store = learners
+    scheduler = ModelScheduler(
+        config,
+        store,
+        SimpleNamespace(),
+        platform=SimpleNamespace(memory=lambda: SimpleNamespace(pressure="normal")),
+    )
+    for model in ("first", "second"):
+        registry.support(store, model, "trainable")
+    probes = schedule.Probes(available=True, thermal=0, power=schedule.Power(ac=True))
+    monkeypatch.setattr(schedule, "probe", lambda platform=None: probes)
+    store.sync_steps(evidence(2))  # Two steps answered by the same reply.
+    batches = []
+
+    async def read(store, url, model, **kwargs):
+        batches.append(model)
+        return 1 if len(batches) == 1 else 0
+
+    monkeypatch.setattr(songe.review, "review", read)
+    # Far too little to train on, and still worth reading now.
+    reply = await scheduler.dream("first")
+    assert reply["started"]
+    # Said at the press: it prepares now, and training cannot start yet.
+    assert reply["message"].startswith("Deep Dream · preparing practice now · training can't start yet: ")
+    await scheduler.dream_task
+    assert len(batches) == 2  # batch after batch until none is left
+    assert store.get("requested_sleep") is not True
+    assert ("review", "1 replies") in [(e["stage"], e["text"]) for e in store.events()]
+
+
+async def test_a_model_the_server_refuses_is_not_reloaded_on_every_retry(
+    learners, monkeypatch
+):
+    """Live: an agent defaulting to weights LM Studio cannot load retried every
+    20 s, and each retry started another doomed load on the user's server."""
+    import songe.schedule as schedule
+
+    class LMStudioServerError(Exception):
+        pass
+
+    config, store = learners
+    loads = []
+
+    async def ensure(version):
+        loads.append(version["id"])
+        if len(loads) != 3:
+            raise LMStudioServerError(
+                "Model load error: Failed to load model. Reported cause: Traceback "
+                '(most recent call last): File "/x.py" ValueError: Model type lfm3 '
+                "not supported. Error: No module named 'drafters.lfm3'"
+            )
+
+    scheduler = ModelScheduler(
+        config, store, SimpleNamespace(ensure=ensure), platform=SimpleNamespace()
+    )
+    version = {"id": "second-binding", "identifier": "second"}
+    with pytest.raises(schedule.LoadRefused) as refused:
+        await scheduler.ensure_model("second", version)
+    assert str(refused.value) == (
+        "the model server could not load second (Model type lfm3 not supported)"
+        " · choose another model in your agent"
+    )
+    assert schedule.refusal_reason(
+        Exception("Failed to load model. Reported cause: x")
+    ) == ("Failed to load model")
+    with pytest.raises(schedule.LoadRefused):
+        await scheduler.ensure_model("second", version)
+    assert len(loads) == 1  # the retry was answered without loading
+    # Later it is tried again, and a load that works clears the memory of it.
+    now = schedule.time.monotonic()
+    monkeypatch.setattr(
+        schedule.time, "monotonic", lambda: now + schedule.LOAD_RETRY_SECONDS + 1
+    )
+    with pytest.raises(schedule.LoadRefused):
+        await scheduler.ensure_model("second", version)
+    assert len(loads) == 2
+    scheduler.load_refused.clear()
+    await scheduler.ensure_model("second", version)
+    assert len(loads) == 3 and not scheduler.load_refused
+    assert scheduler.serving_model == "second"
+
+
+def test_scheduler_picks_pending_then_least_recent_and_skips_off_unsupported(learners):
+    config, store = learners
+    store.sync_steps(evidence())
+    scheduler = ModelScheduler(
+        config, store, SimpleNamespace(), platform=SimpleNamespace()
+    )
+    store.scoped("first").set("last_completed", 200)
+    store.scoped("second").set("last_completed", 100)
+    assert scheduler.choose_model() == "second"
+    store.scoped("second").mark_scored(evidence()[:1])
+    assert scheduler.choose_model() == "first"
+    registry.enable(store, "first", False)
+    assert scheduler.choose_model() == "second"
+    registry.support(
+        store,
+        "second",
+        "unsupported",
+        "Backward pass: architecture fixture is not supported",
+    )
+    assert scheduler.choose_model() is None
+    state = snapshot(config, store)
+    assert state["models"][0]["status"] == "off"
+    assert state["models"][1]["status"] == "unsupported"
+    assert "architecture" in state["models"][1]["reason"]
+
+
+def test_undo_is_per_model_and_requires_choice_when_ambiguous(learners, monkeypatch):
+    config, store = learners
+
+    def offline(*a, **kw):
+        raise httpx.ConnectError("offline")
+
+    monkeypatch.setattr(httpx.Client, "get", offline)
+    for model, key in (("first", "night-1"), ("second", "night-2")):
+        scoped = store.scoped(model)
+        scoped.add_version(version(key, 1))
+        scoped.swap(key, scoped.get("current"))
+    client = LocalClient(store.root, config)
+    with pytest.raises(ValueError, match="Choose a model"):
+        client.control("undo")
+    client.control("undo", model="second")
+    assert store.scoped("second").version()["id"].startswith("base-")
+    assert store.scoped("first").get("current") == "night-1"
+    assert store.scoped("second").get("previous") == "night-2"
+    with pytest.raises(ValueError, match="Unknown version"):
+        store.scoped("second").swap("night-1", store.scoped("second").get("current"))
+
+
+def test_existing_single_model_database_migrates_without_losing_undo(tmp_path):
+    root = tmp_path / "old"
+    root.mkdir()
+    config = Config(model=str(root / "weights"), base_identifier="legacy")
+    config.save(root)
+    # An actual pre-feature v2 database, including its original three-column pool.
+    with sqlite3.connect(root / "experience.sqlite3") as db:
+        db.executescript(SCHEMA + SCHEMA_V2)
+        db.execute("PRAGMA user_version=2")
+        for name in ("base", "old-update"):
+            db.execute(
+                "INSERT INTO versions VALUES (?,?,?,?,?,?)",
+                (name, name, "/fixture/weights", None, 1, 0),
+            )
+        for key, value in (
+            ("current", "old-update"),
+            ("previous", "base"),
+            ("score_watermark", 7),
+        ):
+            db.execute("INSERT INTO state VALUES (?,?)", (key, json.dumps(value)))
+        db.execute(
+            "INSERT INTO pool VALUES (?,?,?)",
+            ("step", 1, json.dumps({"id": "step", "surprise": 1})),
+        )
+        db.execute("INSERT INTO scored_revisions VALUES (?,?)", ("step", 7))
+    store = Store(root)
+    registry.migrate(config, store)
+    registry.migrate(config, store)
+    scoped = store.scoped("legacy")
+    assert len(registry.entries(store)) == 1
+    assert scoped.get("current") == "old-update"
+    assert scoped.version(scoped.get("previous"))["id"] == "base"
+    assert scoped.get("score_watermark") == 7
+    assert registry.find(store, "legacy")["learning_level"] == "new"
+    assert scoped.pool() == []  # Earlier replay remains stored, outside 'new'.
+    with store.connect() as db:
+        assert (
+            json.loads(db.execute("SELECT step FROM pool").fetchone()[0])["id"]
+            == "step"
+        )
+    assert scoped.unscored([{"id": "step", "source_id": 7}]) == []
+
+
+def test_model_config_and_candidate_invalidation_are_isolated(learners):
+    config, store = learners
+    second = store.scoped("second")
+    other = Config.for_model(store.root, "second")
+    other.calibrated_step_seconds = 123
+    other.save(store.root)
+    assert Config.for_model(store.root, "second").calibrated_step_seconds == 123
+    assert (
+        Config.load(store.root).calibrated_step_seconds
+        == config.calibrated_step_seconds
+    )
+    first_night = store.scoped("first").night(None)
+    second_night = second.night(None)
+    first_generation = store.scoped("first").get("candidate_generation")
+    registry.enable(store, "second", False)
+    assert store.scoped("first").nights()[0]["status"] == "running"
+    assert second.nights()[0]["status"] == "discarded"
+    assert store.scoped("first").get("candidate_generation") == first_generation
+    assert {n["id"] for n in store.nights()} == {first_night, second_night}
+
+
+async def test_live_snapshot_identifies_training_model_and_phase(learners):
+    config, store = learners
+    scoped = store.scoped("second")
+    night = scoped.night(None)
+    progress = {"phase": "train", "completed": 20, "total": 20, "unit": "samples"}
+    selected = Config.for_model(store.root, "second")
+    selected.accumulation = 3
+    selected.save(store.root)
+    scoped.night(
+        night, phase="distill", progress=0.4, record={"data_progress": progress}
+    )
+    scheduler = SimpleNamespace(
+        active_model="second", process=object(), calibrating=False, reason="Learning"
+    )
+    data = snapshot(config, store, scheduler, live=True)
+    assert data["training_model"] == "songe/second"
+    assert data["training"]["phase"] == "distill"
+    assert data["training"]["data_progress"] == progress
+    assert data["training"]["step"] == data["training"]["total_steps"] == 7
+    assert data["nights"][0]["model"] == "songe/second"
+
+
+def test_forwarding_init_without_model_or_local_weights(tmp_path, monkeypatch):
+    from songe import agents, cli, launchd
+    from songe.models import discovery
+    from songe.platform import Memory
+
+    platform = SimpleNamespace(
+        name="test", accelerators=lambda: [], memory=lambda: Memory(1000, 500)
+    )
+    monkeypatch.setattr("songe.platform.current", lambda: platform)
+    monkeypatch.setattr(cli, "detect_agent_binding", lambda: ("", ""))
+    monkeypatch.setattr(discovery, "ollama", lambda **kw: [])
+    monkeypatch.setattr(cli, "upstream_model_ids", lambda url: ["one", "two"])
+    monkeypatch.setattr(cli, "confirm", lambda *a: True)
+    proposed = []
+    monkeypatch.setattr(
+        agents, "proposed", lambda c, **kw: proposed.extend(c.exposed_models) or []
+    )
+    monkeypatch.setattr(agents, "apply", lambda *a: None)
+    monkeypatch.setattr(launchd, "install", lambda *a, **kw: None)
+    root = tmp_path / "data"
+    args = cli.parser().parse_args(
+        [
+            "init",
+            "--upstream",
+            "ollama",
+            "--launchd-target",
+            str(tmp_path / "service"),
+            "--yes",
+        ]
+    )
+    cli.initialize(args, root)
+    config = Config.load(root)
+    assert config.model == ""
+    assert config.exposed_models == ["songe/one", "songe/two"]
+    assert proposed == ["one", "two"]
+    assert {m["id"] for m in registry.entries(Store(root))} == {"one", "two"}
+
+
+def test_agent_providers_expose_all_user_models(config):
+    from songe.agents import opencode, pi
+
+    config.exposed_models = ["one", "two"]
+    config.base_identifier = "one"
+    oc = opencode.configure({}, config, default=True, v2=True)
+    assert set(oc["providers"]["songe"]["models"]) == {config.public_model, "songe/two"}
+    assert oc["model"] == "songe/" + config.public_model
+    assert [
+        m["id"] for m in pi.configure({}, config)["providers"]["songe"]["models"]
+    ] == [config.public_model, "songe/two"]
+
+
+async def test_idle_discovery_adds_second_base_and_records_unsupported_reason(learners):
+    config, store = learners
+    registry.observe(config, store, "new")
+    registry.observe(config, store, "unavailable")
+    ref = ModelRef(config.upstream, "new", "safetensors", store.root / "new", "fixture")
+    scheduler = ModelScheduler(config, store, SimpleNamespace(discover=lambda: [ref]))
+    await scheduler.discover_models()
+    assert store.scoped("new").version()["identifier"] == "new"
+    assert Config.for_model(store.root, "new").model == str(ref.path)
+    row = registry.find(store, "unavailable")
+    assert row["support"] == "unsupported"
+    assert "not discoverable" in row["reason"]
+
+
+def test_all_level_reuses_existing_shared_data(learners):
+    config, store = learners
+    store.sync_steps(evidence())
+    store.scoped("first").mark_scored(evidence())
+    registry.observe(config, store, "new-after-data")
+    registry.enable(store, "new-after-data", False)
+    registry.set_learning(store, "new-after-data", "all")
+    assert store.scoped("new-after-data").experience_counts() == (5, 0, 5)
+    assert (
+        len(store.scoped("new-after-data").unscored(store.active_steps("train"))) == 5
+    )
+
+
+def test_forget_resets_every_learner_and_keeps_versions(learners):
+    _, store = learners
+    store.sync_steps(evidence())
+    for model in ("first", "second"):
+        store.scoped(model).mark_scored(evidence())
+        store.scoped(model).set("experience_watermark", 5)
+    store.forget()
+    for model in ("first", "second"):
+        scoped = store.scoped(model)
+        assert scoped.version() is not None
+        assert scoped.get("experience_watermark") is None
+        assert scoped.get("rebuild_required") is True
+        assert scoped.experience_counts() == (0, 0, 0)
+
+
+async def test_accept_and_live_undo_change_only_second_model(learners, monkeypatch):
+
+    from songe.schedule import base_fingerprint
+    from tests.test_swap import Upstream
+
+    config, store = learners
+    upstream = Upstream()
+    scheduler = ModelScheduler(config, store, upstream)
+    scheduler.select("second")
+    scheduler.last_traffic -= 2000
+    second = store.scoped("second")
+    original = second.get("current")
+    night = second.night(None)
+    record = {
+        "candidate": version(f"night-{night}", night),
+        "expected": original,
+        "generation": second.get("candidate_generation"),
+        "configuration": training_fingerprint(scheduler.config),
+        "base_fingerprint": base_fingerprint(scheduler.config),
+        "environment": store.get("environment_fingerprint"),
+        "watermark": 5,
+    }
+    second.night(night, status="ready", record=record)
+    real = httpx.AsyncClient
+    monkeypatch.setattr(
+        httpx,
+        "AsyncClient",
+        lambda **kw: real(
+            transport=httpx.MockTransport(
+                lambda request: httpx.Response(200, json={"choices": [{}]})
+            )
+        ),
+    )
+    await scheduler.accept(second.nights()[-1])
+    assert second.get("current") == f"night-{night}"
+    assert store.scoped("first").get("current") == "base"
+    assert second.get("experience_watermark") == 5
+    assert store.scoped("first").get("experience_watermark") is None
+    await scheduler.return_to(0, model="second")
+    assert second.get("current") == original
+    assert store.scoped("first").get("current") == "base"
+    assert upstream.loaded == [f"night-{night}", original]
+
+
+async def test_global_serving_switch_waits_for_other_model_requests(learners):
+    import asyncio
+
+    config, store = learners
+    config.upstream = "llamacpp"
+    loaded = []
+
+    async def ensure(version):
+        loaded.append(version["id"])
+
+    scheduler = ModelScheduler(config, store, SimpleNamespace(ensure=ensure))
+    first = store.scoped("first").version()
+    second = store.scoped("second").version()
+    scheduler.acquire(first["id"])
+    task = asyncio.create_task(scheduler.ensure_model("second", second))
+    await asyncio.sleep(0)
+    assert loaded == []
+    scheduler.release(first["id"])
+    await task
+    assert loaded == [second["id"]]
+
+
+def test_calibration_persists_observed_unsupported_reason(learners, monkeypatch):
+    import sys
+
+    from songe.sleep import calibrate
+
+    _, store = learners
+
+    def unsupported(*a):
+        raise ValueError(
+            "Backward pass: fixture architecture does not implement gradients"
+        )
+
+    monkeypatch.setattr(calibrate, "_calibrate", unsupported)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "calibrate",
+            "--child",
+            "--data-dir",
+            str(store.root),
+            "--model-key",
+            "second",
+        ],
+    )
+    with pytest.raises(ValueError, match="gradients"):
+        calibrate.main()
+    row = registry.find(store, "second")
+    assert row["support"] == "unsupported"
+    assert (
+        row["reason"]
+        == "Backward pass: fixture architecture does not implement gradients"
+    )
+    assert registry.find(store, "first")["support"] == "trainable"
+
+
+async def test_scheduler_runs_one_guarded_model_worker_and_yields_when_off(
+    learners, monkeypatch
+):
+    from songe import schedule
+    from songe.platform import Accel, Memory
+    from tests.test_schedule import good
+
+    config, store = learners
+    registry.enable(store, "first", False)
+    registry.support(store, "second", "pending", "Waiting for measured trainability")
+    platform = SimpleNamespace(
+        name="test",
+        memory=lambda: Memory(24 * 10**9, 20 * 10**9),
+        accelerators=lambda: [Accel("cuda", "fixture", 8 * 10**9, 8 * 10**9)],
+        keep_awake=lambda pid: None,
+    )
+
+    async def park(on_snapshot):
+        on_snapshot([])
+
+    scheduler = ModelScheduler(config, store, SimpleNamespace(park=park), platform)
+    scheduler.last_traffic -= 2000
+    monkeypatch.setattr(schedule, "probe", lambda p: good())
+    monkeypatch.setattr(schedule, "guard", lambda *a, **kw: None)
+    signals, launched = [], []
+    child = SimpleNamespace(pid=1, returncode=None)
+
+    async def spawn(*args, **kwargs):
+        launched.append(args)
+        return child
+
+    monkeypatch.setattr(schedule.asyncio, "create_subprocess_exec", spawn)
+    monkeypatch.setattr(
+        schedule, "interrupt_group", lambda process: signals.append(process)
+    )
+    await scheduler.tick()
+    assert len(launched) == 1
+    assert "songe.sleep.calibrate" in launched[0]
+    assert launched[0][launched[0].index("--model-key") + 1] == "second"
+    assert scheduler.active_model == "second"
+    assert (
+        snapshot(config, store, scheduler, live=True)["training"]["phase"]
+        == "calibrate"
+    )
+    await scheduler.guard_task
+    await scheduler.tick()
+    assert len(launched) == 1
+    registry.enable(store, "second", False)
+    await scheduler.tick()
+    assert signals == [child]
+
+
+async def test_measured_memory_failure_retries_only_that_model_later(learners):
+    from songe.memory import Snapshot
+
+    config, store = learners
+    registry.support(store, "second", "pending")  # its first measurement
+    scheduler = ModelScheduler(config, store, SimpleNamespace())
+    scheduler.select("second")
+    scheduler.calibrating = True
+    scheduler.memory_stop_sample = Snapshot(1000, 15, "critical")
+
+    async def waited():
+        return 1
+
+    scheduler.process = SimpleNamespace(returncode=1, wait=waited)
+    # No runtime was loaded, so restoration has no work in this fake endpoint.
+    registry.enable(store, "first", False)
+    await scheduler.finish()
+    row = registry.find(store, "second")
+    # A memory stop is not evidence the model cannot train: retry when idle.
+    assert row["support"] == "pending"
+    assert "memory" in row["reason"] and "Snapshot(" not in row["reason"]
+    assert registry.find(store, "first")["support"] == "trainable"
+    # A trainable model measuring again (growth) stays trainable (live: a
+    # crowded Mac turned it back to "pending").
+    registry.support(store, "second", "trainable")
+    scheduler.select("second")
+    scheduler.calibrating = True
+    scheduler.memory_stop_sample = Snapshot(1000, 15, "critical")
+    scheduler.process = SimpleNamespace(returncode=1, wait=waited)
+    await scheduler.finish()
+    assert registry.find(store, "second")["support"] == "trainable"
+
+
+def test_pending_counts_selected_data_until_training_finishes(learners):
+    _, store = learners
+    store.sync_steps(evidence())
+    second = store.scoped("second")
+    second.add_pool([s | {"surprise": 2} for s in evidence()])
+    second.mark_scored(evidence())
+    assert second.experience_counts()[2] == 0
+    assert second.pending_learnable() == 5
+    second.set("experience_watermark", 5)
+    assert second.pending_learnable() == 0
+    assert store.scoped("first").pending_learnable() == 5
+
+
+def test_init_model_preenables_another_base_without_rebinding_history(
+    learners, monkeypatch
+):
+    from songe import agents, cli, launchd
+    from songe.models import discovery
+
+    config, store = learners
+    weights = store.root / "third-weights"
+    weights.mkdir()
+    ref = ModelRef(config.upstream, "third", "safetensors", weights, "fixture")
+    monkeypatch.setattr(cli, "detect_agent_binding", lambda: ("", ""))
+    monkeypatch.setattr(discovery, "lmstudio", lambda **kw: [ref])
+    monkeypatch.setattr(discovery, "loaded_lmstudio", lambda refs, *a: refs)
+    monkeypatch.setattr("songe.upstream.lmstudio.find_lms", lambda: "/fixture/lms")
+    monkeypatch.setattr(
+        "songe.platform.current",
+        lambda: SimpleNamespace(name="test", accelerators=lambda: []),
+    )
+    monkeypatch.setattr(agents, "proposed", lambda *a, **kw: [])
+    monkeypatch.setattr(agents, "apply", lambda *a: None)
+    monkeypatch.setattr(launchd, "install", lambda *a, **kw: None)
+    args = cli.parser().parse_args(
+        [
+            "init",
+            "--model",
+            str(weights),
+            "--upstream",
+            config.upstream,
+            "--yes",
+            "--launchd-target",
+            str(store.root / "service"),
+        ]
+    )
+    cli.initialize(args, store.root)
+    assert Config.load(store.root).model == config.model
+    assert store.scoped("first").get("current") == "base"
+    assert registry.find(store, "third")["enabled"] is True
+    assert "songe/third" in Config.load(store.root).exposed_models
+
+
+async def test_scheduler_skips_model_waiting_for_initial_batch(learners):
+    config, store = learners
+    config.min_train, config.min_heldout = 1, 1
+    store.sync_steps(evidence() + [evidence(1)[0] | {"id": "held", "split": "heldout"}])
+    second = store.scoped("second")
+    second.mark_scored(evidence()[:1])
+    second.set("score_watermark", 1)
+    measured = Config.for_model(store.root, "second")
+    measured.calibration_available = True
+    measured.save(store.root)
+    scheduler = ModelScheduler(config, store, SimpleNamespace())
+    assert scheduler.choose_model() == "first"  # Five pending, versus four.
+    assert await scheduler.next_model() == "second"  # Its incremental batch can run.
+
+
+def test_old_memory_stop_unsupported_marks_are_reset(learners):
+    config, store = learners
+    registry.support(
+        store,
+        "second",
+        "unsupported",
+        "Calibration stopped at measured memory pressure: Snapshot(total=1)",
+    )
+    registry.migrate(config, store)
+    assert registry.find(store, "second")["support"] == "pending"
+
+
+async def test_errors_retry_forever_with_a_doubling_wait(learners):
+    from songe.schedule import retry_wait
+
+    config, store = learners
+    registry.enable(store, "first", False)
+
+    async def waited():
+        return 1
+
+    for attempt in range(1, 6):
+        scheduler = ModelScheduler(config, store, SimpleNamespace())
+        scheduler.select("second")
+        scheduler.calibrating = True
+        scheduler.process = SimpleNamespace(returncode=1, wait=waited)
+        await scheduler.finish()
+        # Errors never retire a model; each one waits twice as long.
+        assert registry.find(store, "second")["support"] == "pending"
+        assert store.scoped("second").get("failures")["count"] == attempt
+    assert [retry_wait(n) for n in (1, 2, 3, 6)] == [300, 600, 1200, 9600]
+    # A memory stop is not an error: the run got that far, so the error
+    # wait ends (live: a 4h wait outlived the fix that made measuring work).
+    scheduler = ModelScheduler(config, store, SimpleNamespace())
+    scheduler.select("second")
+    scheduler.process = SimpleNamespace(returncode=75, wait=waited)
+    await scheduler.finish()
+    assert store.scoped("second").get("failures") is None
+    scheduler.select("second")
+    scheduler.process = SimpleNamespace(returncode=0, wait=waited)
+    await scheduler.finish()
+    assert store.scoped("second").get("failures") is None
+
+
+def test_a_failed_restore_never_ends_the_scheduler_loop():
+    import asyncio
+    from types import SimpleNamespace
+
+    from songe.schedule import Scheduler
+
+    calls = []
+
+    class Fake:
+        stopping = False
+        process = None
+        reason = ""
+        store = SimpleNamespace(get=lambda key: ["parked"])
+        config = SimpleNamespace(guard_max_interval=0)
+
+        def upgraded(self):
+            return False
+
+        async def tick(self):
+            calls.append("tick")
+            if len(calls) > 4:
+                self.stopping = True
+            raise RuntimeError("upstream gone")
+
+        async def restore(self):
+            raise RuntimeError("still gone")
+
+    asyncio.run(Scheduler.loop(Fake()))
+    assert calls.count("tick") == 5
+
+
+def test_an_explicit_off_survives_first_use(config, store):
+    from songe.models import registry
+
+    registry.migrate(config, store)
+    model = config.base_identifier
+    registry.set_learning(store, model, "off")
+    registry.mark_chosen(store, model)
+    assert registry.observe(config, store, model)["learning_level"] == "off"
+
+
+def test_foreground_traffic_cancels_a_running_review(monkeypatch):
+    import asyncio
+    from types import SimpleNamespace
+
+    from songe import review as review_module
+    from songe.schedule import ModelScheduler, Scheduler
+
+    started = asyncio.Event()
+
+    async def slow_review(*args, **kwargs):
+        started.set()
+        await asyncio.sleep(60)
+        return 1
+
+    monkeypatch.setattr(review_module, "review", slow_review)
+
+    class Fake:
+        process = None
+        in_flight = {}
+        last_traffic = 0.0
+        traffic_revision = 0
+        installation_store = None
+        installation_config = SimpleNamespace(upstream_url="http://x")
+        platform = SimpleNamespace(memory=lambda: SimpleNamespace(pressure="normal"))
+
+        async def review_model(self):
+            return "m"
+
+        def interrupt(self, reason=None):
+            pass
+
+        traffic = Scheduler.traffic
+
+    async def main():
+        fake = Fake()
+        running = asyncio.create_task(ModelScheduler.review_replies(fake))
+        await asyncio.wait_for(started.wait(), 1)
+        fake.traffic()
+        await asyncio.wait_for(running, 1)
+        assert fake.review_task is None
+
+    asyncio.run(main())
+
+
+def test_models_resolve_by_the_name_songe_models_shows(config, store):
+    """Live run: `songe models Qwen3.5-0.8B all` said Unknown model."""
+    registry.migrate(config, store)
+    registry.register(config, store, "lmstudio-community/Qwen3.5-0.8B-MLX-4bit")
+    row = registry.find(store, "qwen3.5-0.8b")
+    assert row["id"] == "lmstudio-community/Qwen3.5-0.8B-MLX-4bit"
+    registry.register(config, store, "other/Qwen3.5-0.8B-Q4_K_M.gguf")
+    assert registry.find(store, "Qwen3.5-0.8B") is None  # ambiguous

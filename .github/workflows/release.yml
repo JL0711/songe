@@ -1,0 +1,82 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  test:
+    uses: ./.github/workflows/ci.yml
+
+  build:
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v7
+        with:
+          python-version: "3.12"
+          enable-cache: true
+      - name: Check tag and source versions
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          uv run --no-project python - <<'PY'
+          import ast
+          import os
+          import pathlib
+          import tomllib
+
+          project = tomllib.loads(pathlib.Path("pyproject.toml").read_text())["project"]
+          tree = ast.parse(pathlib.Path("src/songe/__init__.py").read_text())
+          version = next(
+              ast.literal_eval(node.value)
+              for node in tree.body if isinstance(node, ast.Assign)
+              if any(isinstance(t, ast.Name) and t.id == "__version__" for t in node.targets)
+          )
+          assert os.environ["RELEASE_TAG"] == f"v{project['version']}", "Tag/version mismatch"
+          assert version == project["version"], "Package/source version mismatch"
+          PY
+      - run: uv build
+      - name: Validate distribution metadata
+        run: uvx twine check --strict dist/*
+      - uses: actions/upload-artifact@v4
+        with:
+          name: python-distributions
+          path: dist/*
+          if-no-files-found: error
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi
+      url: https://pypi.org/p/songe
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: python-distributions
+          path: dist/
+      - uses: pypa/gh-action-pypi-publish@release/v1
+
+  notify-tap:
+    needs: publish
+    if: vars.HOMEBREW_TAP_ENABLED == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Notify the Homebrew tap after publication
+        env:
+          GH_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          gh api --method POST repos/sous-labs/homebrew-tap/dispatches \
+            -f event_type=songe-release -f "client_payload[version]=${RELEASE_TAG#v}"

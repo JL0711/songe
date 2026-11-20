@@ -1,0 +1,5 @@
+✓ Service removed
+✓ Agent configurations restored
+✓ Songe uninstalled
+  Data kept  <data>
+  Delete     songe uninstall --purge

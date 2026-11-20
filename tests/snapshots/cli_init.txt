@@ -1,0 +1,16 @@
+  Models    one, two
+  Upstream  vllm · http://127.0.0.1:8000/v1
+  Agents    <tmp>/agent.json
+  Data      <tmp>/data
+  Service   starts at login
+  Replace   loaded copy when a better version is ready
+
+✓ Service running · starts at login
+✓ Connected pi
+✓ Ready · http://127.0.0.1:7613/v1
+
+Use your agent as usual · learning starts when idle
+  songe open       dashboard
+  songe status     what it is doing
+  songe pause      stop learning
+  songe uninstall  remove everything

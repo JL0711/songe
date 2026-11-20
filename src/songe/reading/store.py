@@ -1,0 +1,260 @@
+"""Which sessions are read, and the signals found in them, per learner.
+
+A session is read again when it grows (its newest exchange id is its
+revision); its old signals are replaced. Reading one session is all or
+nothing: a stopped reading leaves the old signals, and the cached model
+answers make the next attempt quick.
+"""
+
+import asyncio
+import json
+import time
+
+from ..steps import digest
+from . import timeline
+from .client import Stopped
+from .extract import read_session
+
+
+def pending(store, limit=None):
+    """[(session, exchange ids)] this learner has not read at their current
+    revision, oldest first."""
+    with store.connect() as db:
+        level, cutoff = store.learning_policy(db)
+        if level == "off":
+            return []
+        found = timeline.sessions(db, cutoff if level == "new" else None)
+        done = dict(
+            db.execute(
+                "SELECT session,revision FROM read_sessions WHERE model_id=?",
+                (store.model_id,),
+            ).fetchall()
+        )
+    out = [(s, ids) for s, ids in found.items() if done.get(s, -1) < max(ids)]
+    return out[:limit] if limit else out
+
+
+def opening_request(items, limit=100):
+    """A conversation's first request, clipped, to say which one is read."""
+    first = next((it for it in items if it.get("kind") == "user"), None)
+    text = " ".join(str((first or {}).get("content") or "").split())
+    return text if len(text) <= limit else text[: limit - 1].rstrip() + "…"
+
+
+def signal_line(signal, limit=110):
+    """One found signal in plain words: the user's own words for feedback,
+    else the short lesson or the evidence."""
+    text = signal.get("text") if signal.get("source") == "user" else None
+    text = " ".join(str(text or signal.get("short") or signal.get("evidence") or signal.get("text") or "").split())
+    return {
+        "type": signal.get("type"),
+        "text": text if len(text) <= limit else text[: limit - 1].rstrip() + "…",
+    }
+
+
+def forget_vanished(store):
+    """Signals and read marks of sessions that no longer exist (merged into
+    another, e.g. an agent's compaction call now joined to the conversation it
+    summarised) are dropped; the merged session is read again as a whole.
+    Returns how many sessions were dropped."""
+    with store.connect() as db:
+        alive = set(timeline.sessions(db))
+        gone = [
+            r[0] for r in db.execute(
+                "SELECT session FROM read_sessions WHERE model_id=?", (store.model_id,)
+            ).fetchall()
+            if r[0] not in alive
+        ]
+        for session in gone:
+            db.execute("DELETE FROM signals WHERE model_id=? AND session=?", (store.model_id, session))
+            db.execute("DELETE FROM read_sessions WHERE model_id=? AND session=?", (store.model_id, session))
+        if gone:
+            db.execute(
+                "DELETE FROM practice WHERE model_id=? AND signal_id NOT IN "
+                "(SELECT id FROM signals WHERE model_id=?)",
+                (store.model_id, store.model_id),
+            )
+    return len(gone)
+
+
+def place_rules(store):
+    """Stated rules read before they carried the step they are about get it
+    now (practice and before/after start there), once each. Returns how many
+    rules were placed."""
+    from ..quick import reacted_action
+
+    with store.connect() as db:
+        rows = db.execute(
+            "SELECT id, session, payload FROM signals WHERE model_id=? AND retired_at IS NULL"
+            " AND json_extract(payload,'$.from')='rules' AND json_extract(payload,'$.placed') IS NULL",
+            (store.model_id,),
+        ).fetchall()
+        if not rows:
+            return 0
+        found = timeline.sessions(db)
+    placed = 0
+    for signal_id, session, payload in rows:
+        s = json.loads(payload)
+        ids = found.get(session)
+        if ids and not s.get("evidence_steps") and s.get("item") is not None:
+            _, items = load_session(store, ids)
+            about = reacted_action(items[: s["item"]], s.get("text") or "")
+            if about and about.get("step"):
+                s["evidence_steps"] = [about["step"]]
+                s["exchanges"] = {str(about["step"]): about["exchange"]}
+                placed += 1
+        s["placed"] = True
+        with store.connect() as db:
+            db.execute("UPDATE signals SET payload=? WHERE id=? AND model_id=?",
+                       (json.dumps(s, ensure_ascii=False), signal_id, store.model_id))
+    return placed
+
+
+def reread_copied(store):
+    """Once: sessions whose lessons were the prompt's own example pasted back
+    are read again (cached answers make it cheap): the copy is no lesson
+    now, and a stated rule there is caught. Returns how many were queued."""
+    from .prompts import copied_example
+
+    if store.get("reread_copied_v1"):
+        return 0
+    sessions = {s["session"] for s in signals(store) if copied_example(s.get("lesson"))}
+    with store.connect() as db:
+        for session in sessions:
+            db.execute("DELETE FROM read_sessions WHERE model_id=? AND session=?", (store.model_id, session))
+    store.set("reread_copied_v1", True)
+    return len(sessions)
+
+
+def reread_unreadable(store):
+    """Once: sessions read when the model's answers could not be read (they
+    were cached as errors and the session marked read with what was left)
+    are read again. Returns how many sessions were queued."""
+    if store.get("reread_unreadable_v1"):
+        return 0
+    with store.connect() as db:
+        keys = {r[0] for r in db.execute("SELECT key FROM reading_cache WHERE answer LIKE '%\"error\": \"no JSON%'")}
+        db.execute("DELETE FROM reading_cache WHERE answer LIKE '%\"error\": \"no JSON%'")
+        sessions = [r[0] for r in db.execute(
+            "SELECT session FROM read_sessions WHERE model_id=?", (store.model_id,)).fetchall()] if keys else []
+        # Which sessions used a failed answer is not recorded: with any
+        # failures cached, every read session of this learner is read again
+        # (the good answers are still cached, so only the failed ones run).
+        for session in sessions:
+            db.execute("DELETE FROM read_sessions WHERE model_id=? AND session=?", (store.model_id, session))
+    store.set("reread_unreadable_v1", True)
+    return len(sessions)
+
+
+def reread_without_short(store):
+    """Sessions read before lessons had a short form are read again, once:
+    every other answer is cached, so only the lesson question runs again.
+    Returns how many sessions were queued."""
+    with store.connect() as db:
+        rows = db.execute(
+            "SELECT DISTINCT session FROM signals WHERE model_id=? AND retired_at IS NULL"
+            " AND json_extract(payload,'$.lesson') IS NOT NULL"
+            " AND json_extract(payload,'$.short') IS NULL",
+            (store.model_id,),
+        ).fetchall()
+        for (session,) in rows:
+            db.execute(
+                "DELETE FROM read_sessions WHERE model_id=? AND session=?",
+                (store.model_id, session),
+            )
+    return len(rows)
+
+
+def counts(store):
+    """{read, unread} sessions for this learner."""
+    unread = len(pending(store))
+    with store.connect() as db:
+        read = db.execute(
+            "SELECT COUNT(*) FROM read_sessions WHERE model_id=?", (store.model_id,)
+        ).fetchone()[0]
+    return {"read": read, "unread": unread}
+
+
+def signals(store, *, types=None):
+    with store.connect() as db:
+        rows = db.execute(
+            "SELECT payload FROM signals WHERE model_id=? AND retired_at IS NULL ORDER BY rowid",
+            (store.model_id,),
+        ).fetchall()
+    found = [json.loads(r[0]) for r in rows]
+    return [s for s in found if types is None or s["type"] in types]
+
+
+def save(store, session, revision, found, items):
+    """Replace this learner's signals for one session."""
+    exchange_of = {it["step"]: it.get("exchange") for it in items if it["kind"] == "action"}
+    with store.connect() as db:
+        db.execute(
+            "DELETE FROM signals WHERE model_id=? AND session=?",
+            (store.model_id, session),
+        )
+        for s in found:
+            steps = s.get("responsible_steps") or s.get("evidence_steps") or []
+            s["exchanges"] = {
+                str(n): exchange_of.get(n) for n in steps if exchange_of.get(n) is not None
+            }
+            s["revision"] = revision
+            s["id"] = digest([session, s["type"], s.get("item"), s.get("text")])
+            db.execute(
+                "INSERT OR REPLACE INTO signals(id,model_id,session,revision,payload) VALUES (?,?,?,?,?)",
+                (s["id"], store.model_id, session, revision, json.dumps(s, ensure_ascii=False)),
+            )
+        db.execute(
+            "INSERT OR REPLACE INTO read_sessions VALUES (?,?,?,?)",
+            (session, store.model_id, revision, time.time()),
+        )
+        # Practice written for signals that are gone goes with them.
+        db.execute(
+            "DELETE FROM practice WHERE model_id=? AND signal_id NOT IN "
+            "(SELECT id FROM signals WHERE model_id=?)",
+            (store.model_id, store.model_id),
+        )
+
+
+def load_session(store, ids):
+    with store.connect() as db:
+        rows = timeline.load(db, ids)
+    return rows, timeline.build(rows)
+
+
+async def read(store, reader, *, limit=None, on_session=None, newest=False, seconds=None,
+               on_start=None):
+    """Read pending sessions until done or the user returns. Returns how many
+    sessions were read.
+
+    newest: most recent first (Quick Dream wants recent feedback); seconds: stop
+    starting new sessions after this long (the rest is read later)."""
+    import time
+
+    done, started = 0, time.monotonic()
+    found = await asyncio.to_thread(pending, store)
+    if newest:
+        found = found[::-1]
+    for session, ids in found[:limit] if limit else found:
+        if seconds is not None and time.monotonic() - started >= seconds:
+            break
+        rows, items = await asyncio.to_thread(load_session, store, ids)
+        if on_start:
+            on_start(session, items)  # which conversation is being read now
+        errors = getattr(reader, "errors", 0)
+        try:
+            found = await read_session(session, items, rows, reader)
+        except Stopped:
+            break
+        if getattr(reader, "errors", 0) > errors:
+            # Some of the model's answers could not be read: the session stays
+            # unread (read again later), and the run says so (live: LM Studio
+            # answers in the reasoning channel; 0 signals, marked read).
+            store_failed = getattr(reader, "failed_sessions", [])
+            reader.failed_sessions = [*store_failed, session]
+            continue
+        await asyncio.to_thread(save, store, session, max(ids), found, items)
+        done += 1
+        if on_session:
+            on_session(session, found)
+    return done

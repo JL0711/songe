@@ -1,0 +1,1149 @@
+import argparse
+import asyncio
+import json
+import os
+import platform as host_platform
+import re
+import shutil
+import signal
+import sqlite3
+import subprocess
+import sys
+import time
+import webbrowser
+from contextlib import ExitStack, contextmanager
+from pathlib import Path
+
+import httpx
+
+from . import NAME, __version__
+from .api import LocalClient, interface_data_dir
+from .config import Config
+from .log import Store
+from .platform.locking import acquire as acquire_lock
+from .storage import private_dir
+from .terminal import console, error, facts, models_table, result, status, step
+from .upgrade import catch_up
+
+PROVIDER = NAME
+
+
+class UsageError(ValueError):
+    """Wrong arguments: the fix is the usage line, not diagnostics."""
+
+    def __init__(self, usage):
+        super().__init__("Invalid arguments")
+        self.usage = usage
+
+
+class ArgumentParser(argparse.ArgumentParser):
+    def error(self, message):
+        error(message, f"usage  {NAME} --help")
+        raise SystemExit(2)
+
+
+def parser():
+    p = ArgumentParser(
+        prog=NAME, description="A local model that learns while you are idle."
+    )
+    p.add_argument("--version", action="version", version=__version__)
+    p.add_argument(
+        "--data-dir",
+        type=Path,
+        default=interface_data_dir(),
+        help="Private data directory",
+    )
+    commands = p.add_subparsers(dest="command")
+    init = commands.add_parser("init", help="Connect your agents and model server")
+    init.add_argument("--yes", action="store_true", help="Accept without asking")
+    init.add_argument("--model", type=Path, help="Model folder or file to start with")
+    init.add_argument(
+        "--upstream", choices=("lmstudio", "mlx", "ollama", "llamacpp", "vllm")
+    )
+    init.add_argument("--name")
+    init.add_argument("--upstream-url")
+    init.add_argument("--ollama-models-dir", type=Path)
+    init.add_argument(
+        "--make-default", action="store_true", help="Make it the agent's default model"
+    )
+    init.add_argument(
+        "--keep-default", action="store_true", help="Leave the agent's default model"
+    )
+    init.add_argument("--show-diff", action="store_true", help="Exact config diffs")
+    init.add_argument("--launchd-target", type=Path, help=argparse.SUPPRESS)
+    commands.add_parser("doctor", help="Check this installation")
+    commands.add_parser("tui", help="Terminal dashboard")
+    commands.add_parser("serve", help="Run the service (started automatically)")
+    undo = commands.add_parser("undo", help="Return a model to its previous version")
+    undo.add_argument("model", nargs="?")
+    undo.add_argument("--version")
+    commands.add_parser("status", help="What Songe is doing")
+    models = commands.add_parser(
+        "models", help="List models · auto-dream on|off"
+    )
+    models.add_argument("model", nargs="?")
+    models.add_argument("level", nargs="?", choices=("on", "off"))
+    for name, text in (
+        ("open", "Dashboard in your browser"),
+        ("pause", "Pause learning"),
+        ("resume", "Resume learning"),
+    ):
+        commands.add_parser(name, help=text)
+    sleep = commands.add_parser("sleep", help="Learn now instead of waiting")
+    sleep.add_argument("--now", action="store_true")
+    sleep.add_argument("--dry-run", action="store_true")
+    forget = commands.add_parser(
+        "forget", help="Delete recorded conversations (learned versions stay)"
+    )
+    forget.add_argument("--yes", action="store_true")
+    uninstall = commands.add_parser(
+        "uninstall", help="Remove Songe and restore agent settings"
+    )
+    uninstall.add_argument("--purge", action="store_true")
+    uninstall.add_argument("--yes", action="store_true")
+    uninstall.add_argument("--launchd-target", type=Path, help=argparse.SUPPRESS)
+    return p
+
+
+def confirm(prompt, yes=False):
+    if yes:
+        return True
+    if not sys.stdin.isatty():
+        raise ValueError("Terminal required · use --yes")
+    default = prompt == "Install?"
+    answer = input(prompt + (" (Y/n) " if default else " (y/N) ")).strip().lower()
+    return answer in {"y", "yes"} or (default and not answer)
+
+
+def confirm_install(config, args):
+    if not confirm("Install?", args.yes):
+        return False
+    config.replace_loaded_model = True
+    return True
+
+
+def detect_agent_binding(home=None):
+    home = home or Path.home()
+    opencode = (
+        Path(os.environ.get("XDG_CONFIG_HOME", home / ".config"))
+        / "opencode/opencode.json"
+    )
+    pi = Path(os.environ.get("PI_CODING_AGENT_DIR", home / ".pi/agent"))
+    state = (
+        Path(os.environ.get("XDG_STATE_HOME", home / ".local/state"))
+        / "opencode/model.json"
+    )
+    try:
+        value = json.loads(opencode.read_text(encoding="utf-8"))
+        model = value.get("model", "")
+        # The model picked in opencode's UI lives in its state file and wins
+        # over the config default, so it is the one the user actually runs.
+        try:
+            recent = json.loads(state.read_text(encoding="utf-8")).get("recent") or []
+            if recent and recent[0].get("modelID"):
+                model = f"{recent[0].get('providerID', '')}/{recent[0]['modelID']}"
+        except (OSError, ValueError, AttributeError):
+            pass
+        provider, _, model_id = model.partition("/")
+        definition = (value.get("providers") or value.get("provider") or {}).get(
+            provider, {}
+        )
+        options = definition.get("settings") or definition.get("options") or {}
+        if model:
+            return model_id or model, options.get("baseURL", "").rstrip("/")
+    except (OSError, ValueError, AttributeError):
+        pass
+    try:
+        value = json.loads((pi / "settings.json").read_text(encoding="utf-8"))
+        model = value.get("defaultModel") or value.get("model")
+        models = (
+            json.loads((pi / "models.json").read_text(encoding="utf-8"))
+            if (pi / "models.json").is_file()
+            else {}
+        )
+        provider = models.get("providers", {}).get(value.get("defaultProvider"), {})
+        if isinstance(model, str):
+            return model, provider.get("baseUrl", "").rstrip("/")
+    except (OSError, ValueError, AttributeError):
+        pass
+    return "", ""
+
+
+def trainable_support(config, ref, platform):
+    from .models.library import support
+
+    try:
+        return support(config, ref, 0, platform)[0]
+    except (OSError, ValueError, AttributeError):
+        return "unsupported"
+
+
+def detect_agent_model(home=None):
+    return detect_agent_binding(home)[0]
+
+
+PRIVACY_PANE = (
+    "x-apple.systempreferences:com.apple.preference.security?Privacy_FilesAndFolders"
+)
+
+
+def open_privacy_settings(platform=sys.platform, run=subprocess.run):
+    """macOS never re-asks after a denial; take the user to the one switch."""
+    if platform == "darwin" and not getattr(open_privacy_settings, "done", False):
+        open_privacy_settings.done = True
+        run(["open", PRIVACY_PANE], check=False, capture_output=True)
+
+
+def initialize(args, root):
+    from dataclasses import asdict, replace
+
+    from . import agents
+    from .backends import install as dependencies
+    from .backends import resolve_kind
+    from .models import ModelRef, discovery
+    from .platform import Rooted, current
+    from .sleep.fuse import candidate_kind
+    from .upstream.lmstudio import find_lms
+
+    config = Config.load(root)
+    if config.model and args.upstream and args.upstream != config.upstream:
+        raise ValueError(
+            "The model server changed · start over: songe uninstall --purge, then songe init"
+        )
+    preferred, agent_url = detect_agent_binding()
+    from urllib.parse import urlparse
+
+    from .api import local_host
+
+    if agent_url and not local_host(urlparse(agent_url).hostname):
+        agent_url = ""
+    if getattr(args, "upstream_url", None):
+        replace(config, upstream_url=args.upstream_url).validate()
+    platform = Rooted(current(), root)
+    kinds = {a.kind for a in platform.accelerators()}
+    can_train = bool(kinds & {"metal", "cuda", "rocm", "xpu"})
+    defaults = {
+        "lmstudio": "http://127.0.0.1:1234/v1",
+        "ollama": "http://127.0.0.1:11434/v1",
+        "llamacpp": "http://127.0.0.1:8080/v1",
+        "mlx": "http://127.0.0.1:1235/v1",
+        "vllm": "http://127.0.0.1:8000/v1",
+    }
+    requested = args.upstream or (config.upstream if config.model else None)
+    folder = discovery.lmstudio_downloads()
+    config.lms = find_lms()
+    if getattr(args, "ollama_models_dir", None):
+        config.ollama_models_dir = str(args.ollama_models_dir.resolve())
+    refs, endpoints, skipped = [], {}, []
+    catalog_refs = []
+    agent_upstream = (
+        discovery.identify(agent_url) if agent_url and not requested else None
+    )
+    if config.model and not args.model:
+        ref = (
+            ModelRef(**(config.model_ref | {"path": Path(config.model_ref["path"])}))
+            if config.model_ref
+            else ModelRef(
+                config.upstream,
+                config.base_identifier or config.model,
+                "mlx" if resolve_kind(config, platform) == "mlx" else "safetensors",
+                Path(config.model),
+                "",
+            )
+        )
+        refs = [ref]
+    else:
+        for name in [requested] if requested else defaults:
+            url = getattr(args, "upstream_url", None) or (
+                config.upstream_url
+                if config.model and config.upstream == name
+                else defaults[name]
+            )
+            if name == agent_upstream:
+                url = agent_url
+            try:
+                if name == "lmstudio":
+                    found = discovery.loaded_lmstudio(
+                        discovery.lmstudio(folder=folder), config.lms, folder
+                    )
+                elif name == "ollama":
+                    found = discovery.ollama(folder=config.ollama_models_dir or None)
+                else:
+                    found = getattr(discovery, name)(url)
+                refs += found
+                endpoints.update({(r.upstream, r.serving_id): url for r in found})
+            except (OSError, ValueError, httpx.HTTPError) as exc:
+                skipped.append(f"{name}: {type(exc).__name__}: {exc}")
+                if isinstance(exc, PermissionError):
+                    open_privacy_settings()
+                continue
+        catalog_refs = list(refs)
+        if args.model:
+            selected = args.model.expanduser().resolve()
+            refs = [r for r in refs if r.path.resolve() == selected]
+            if not refs:
+                name = requested or (
+                    "lmstudio"
+                    if selected.is_relative_to(folder)
+                    else ("mlx" if "metal" in kinds else "vllm")
+                )
+                if selected.is_file():
+                    from .models.gguf import read_gguf
+
+                    refs = [
+                        ModelRef(
+                            name,
+                            str(selected),
+                            "gguf",
+                            selected,
+                            read_gguf(selected).architecture,
+                        )
+                    ]
+                else:
+                    refs = [discovery.folder_ref(selected, name)]
+    skipped += [
+        f"{r.upstream}: {r.path} unreadable" for r in refs if not r.path.exists()
+    ]
+    refs = [r for r in refs if r.path.exists()]
+    if not refs:
+        # Models may be usable for forwarding even when the server does not
+        # expose local weight paths. This is a supported serve-only binding.
+        for name in [requested] if requested else defaults:
+            url = getattr(args, "upstream_url", None) or defaults[name]
+            try:
+                ids = upstream_model_ids(url)
+            except (OSError, ValueError, httpx.HTTPError):
+                continue
+            if ids:
+                config.upstream, config.upstream_url = name, url
+                config.exposed_models = ids
+                if not config.model:
+                    config.base_identifier = ids[0]
+                changes = agents.proposed(
+                    config, default=default_choice(args), root=root
+                )
+                facts(
+                    [
+                        ("Models", ", ".join(ids)),
+                        ("Upstream", f"{name} · {url}"),
+                        (
+                            "Agents",
+                            ", ".join(str(path) for path, *_ in changes) or "none",
+                        ),
+                        ("Data", str(root)),
+                        ("Service", "starts at login"),
+                        ("Replace", "loaded copy when a better version is ready"),
+                    ]
+                )
+                console().print()
+                if getattr(args, "show_diff", False):
+                    for *_, diff in changes:
+                        print(diff)
+                if not confirm_install(config, args):
+                    return
+                config.save(root)
+                from .models import registry
+
+                existing = Store(root)
+                registry.migrate(config, existing)
+                for model in ids:
+                    registry.register(config, existing, model)
+                agents.migrate(config, root, update_agents=False)
+                finish_initialization(config, args, root, changes)
+                return
+        detail = "".join(f"\n  {line}" for line in skipped)
+        raise ValueError(
+            "Local model unavailable · --model <path> --upstream <name>"
+            + (f"\nChecked:{detail}" if detail else "")
+        )
+
+    # The file the agent's model name really is, when the server can say.
+    named = discovery.lmstudio_key_path(
+        config.lms, preferred, config.models_dir or folder
+    )
+
+    def preference(ref):
+        identifiers = (
+            ref.serving_id,
+            ref.serving_id.removesuffix(":latest"),
+            ref.path.name,
+        )
+        # A model last run through an earlier Songe keeps its "songe/" name.
+        normalized = re.sub(r"[^a-z0-9]", "", preferred.removeprefix("songe/").lower())
+        return (
+            not (named and ref.path.resolve() == named.resolve()),
+            not any(
+                normalized and normalized in re.sub(r"[^a-z0-9]", "", value.lower())
+                for value in identifiers
+            ),
+            # Otherwise a model that can learn beats one that only serves.
+            len(refs) > 1 and trainable_support(config, ref, platform) == "unsupported",
+            ref.upstream != agent_upstream,
+            ref.upstream,
+            # Discovery lists loaded models first: with no agent match, the
+            # model the server is running now wins over alphabetical order.
+            refs.index(ref),
+        )
+
+    ref = min(refs, key=preference)
+    if ref.upstream == "lmstudio" and not config.model:
+        # A loaded runtime alias identifies an instance, not another model.
+        ref = next(
+            (r for r in reversed(refs) if r.path.resolve() == ref.path.resolve()),
+            ref,
+        )
+    catalog_refs = list(
+        {
+            (r.upstream, r.path.resolve()): r
+            for r in [r for r in catalog_refs if r.path.exists()] + refs
+        }.values()
+    )
+    config.exposed_models = list(
+        dict.fromkeys(
+            [
+                *config.exposed_models,
+                *(r.serving_id for r in catalog_refs if r.upstream == ref.upstream),
+            ]
+        )
+    )
+    if config.model:
+        config.exposed_models.append(config.public_model)
+    if (
+        config.model
+        and args.model
+        and str(ref.path) not in {config.model, config.model_ref.get("path")}
+    ):
+        if ref.upstream != config.upstream:
+            raise ValueError(
+                "The model server changed · start over: songe uninstall --purge, then songe init"
+            )
+        preenable_model(args, root, config, ref, catalog_refs)
+        return
+    config.upstream = ref.upstream
+    selected_url = getattr(args, "upstream_url", None) or (
+        config.upstream_url
+        if config.model and config.upstream == requested
+        else endpoints.get((ref.upstream, ref.serving_id), defaults[ref.upstream])
+    )
+    if not (config.server_owned and selected_url == config.server_source_url):
+        config.upstream_url = selected_url
+    config.models_dir = str(folder)
+    config.model_ref = asdict(ref) | {"path": str(ref.path)}
+    config.base_identifier = ref.serving_id
+    name = args.name or (
+        config.public_model.partition("/")[2]
+        if config.model
+        else re.sub(r"[^a-zA-Z0-9._-]+", "-", ref.serving_id.rsplit("/", 1)[-1]).strip(
+            "-"
+        )
+    )
+    if not re.fullmatch(r"[a-zA-Z0-9._-]+", name):
+        raise ValueError("Model name: letters, digits, ., _, -")
+    config.public_model = f"{PROVIDER}/{name}"
+    config.artifact_kind = candidate_kind(replace(config, artifact_kind=""), platform)
+    existing = Store(root)
+    bound = Config.load(root)
+    if (existing.version() or existing.nights()) and (
+        bound.upstream_url != config.upstream_url
+        or bound.public_model != config.public_model
+        or bound.upstream != config.upstream
+        or (bound.model_ref and bound.model_ref != config.model_ref)
+        or (
+            args.model
+            and bound.model
+            and str(ref.path) not in {bound.model, bound.model_ref.get("path")}
+        )
+    ):
+        raise ValueError(
+            "The model or its server changed · start over: songe uninstall --purge, then songe init"
+        )
+    if not ref.path.exists():
+        raise ValueError(f"Local model unavailable: {ref.path}")
+    commands = dependencies.plan(platform, root)
+    if not commands:
+        commands = dependencies.conversion_plan(
+            ref, config.artifact_kind, platform, root
+        )
+    if config.upstream in {"llamacpp", "vllm", "mlx"} and not commands:
+        from .upstream.supervisor import listening_server, provision_endpoint
+
+        if not config.server_owned:
+            server = listening_server(config) if config.upstream != "mlx" else None
+            if server:
+                config.server_command = server.cmdline()
+            if config.upstream == "llamacpp" and not config.server_command:
+                config.server_command = [shutil.which("llama-server") or "llama-server"]
+            provision_endpoint(config)
+    v2 = False
+    if shutil.which("opencode"):
+        result = subprocess.run(
+            ["opencode", "--version"], capture_output=True, text=True, timeout=10
+        )
+        match = re.search(r"(\d+)\.", result.stdout)
+        v2 = bool(match and int(match[1]) >= 2)
+    changes = agents.proposed(
+        config, default=default_choice(args), opencode_v2=v2, root=root
+    )
+    labels = {
+        "lmstudio": "LM Studio",
+        "ollama": "Ollama",
+        "llamacpp": "llama.cpp",
+        "mlx": "mlx-lm",
+        "vllm": "vLLM",
+    }
+    public = config.public_model
+    server = labels.get(config.upstream, config.upstream)
+    rows = [("Model", f"{Path(ref.serving_id).name}  ({server})")]
+    for path, _, result, _ in changes:
+        agent = "opencode" if "opencode" in str(path) else "pi"
+        # Say "default" only when the agent's default now goes through Songe.
+        default = ", default" if b'"model": "songe/' in result else ""
+        if agent == "pi" and not default:
+            default = " · choose it with /model"
+        rows.append(("Agent", f"{agent} → {public}{default}"))
+    rows += [("Data", str(root)), ("Service", "starts at login")]
+    if not can_train:
+        rows.append(("Learning", "records only · no GPU for training"))
+    else:
+        rows.append(("Learning", "new conversations · starts when idle"))
+    if config.server_owned:
+        rows.append(("Server", f"{server} · {config.upstream_url}"))
+    if commands:
+        rows.append(("Download", "training runtime"))
+    rows.append(("Replace", "loaded copy when a better version is ready"))
+    console().print()
+    facts(rows)
+    console().print(f"\nremove anytime  {NAME} uninstall\n")
+    if getattr(args, "show_diff", False):
+        dependencies.display(commands)
+        for *_, diff in changes:
+            print(diff)
+    if not confirm_install(config, args):
+        print("Changes: none")
+        return
+    if commands:
+        with step("Downloading runtime", "Runtime installed"):
+            dependencies.install(commands, root)
+    if commands:
+        # Resume init with the private interpreter, keeping the one approval.
+        command = [
+            str(dependencies.runtime_python(root)),
+            "-m",
+            "songe",
+            "--data-dir",
+            str(root),
+            "init",
+            "--yes",
+            "--model",
+            str(ref.path),
+            "--upstream",
+            ref.upstream,
+            "--upstream-url",
+            config.upstream_url,
+            "--name",
+            name,
+        ]
+        if args.make_default:
+            command.append("--make-default")
+        if getattr(args, "keep_default", False):
+            command.append("--keep-default")
+        if args.launchd_target:
+            command += ["--launchd-target", str(args.launchd_target)]
+        if config.ollama_models_dir:
+            command += ["--ollama-models-dir", config.ollama_models_dir]
+        subprocess.run(command, check=True)
+        return
+    old_model = config.model
+    if old_model and not args.model:
+        selected = Path(old_model)
+    else:
+        selected = ref.path
+    config.model = str(selected)
+    if selected.is_dir():
+        raw = json.loads((selected / "config.json").read_text(encoding="utf-8"))
+        config.context_window = min(
+            raw.get("text_config", raw).get("max_position_embeddings", 8192), 8192
+        )
+        config.max_sequence = config.context_window
+    if old_model and old_model != config.model:
+        raise ValueError(
+            "The model's files changed · start over: songe uninstall --purge, then songe init"
+        )
+    config.save(root)
+    if not existing.version("base"):
+        existing.add_version(
+            {
+                "id": "base",
+                "identifier": config.base_identifier,
+                "artifact": str(ref.path),
+                "adapter": None,
+                "kind": "base"
+                if config.upstream == "vllm"
+                else ("gguf-full" if ref.format == "gguf" else "mlx-fused"),
+                "created": time.time(),
+                "night": 0,
+            }
+        )
+        existing.swap("base", None)
+    from .models import registry
+
+    registry.migrate(config, existing)
+    for found in catalog_refs:
+        if found.upstream == config.upstream:
+            registry.register(config, existing, found.serving_id, found)
+    agents.migrate(config, root, update_agents=False)
+    # Recording starts now; the scheduler measures this machine in the first
+    # idle gap, under the same memory, battery and traffic rules as training.
+    finish_initialization(config, args, root, changes)
+
+
+def preenable_model(args, root, config, ref, refs):
+    """Adding a base never rebinds the primary learner or its undo history."""
+    from dataclasses import replace
+
+    from . import agents
+    from .models import registry
+    from .models.names import public_name
+
+    proposal = replace(
+        config,
+        base_identifier=ref.serving_id,
+        public_model=public_name(ref.serving_id),
+    )
+    changes = agents.proposed(proposal, default=default_choice(args), root=root)
+    facts([("Model", ref.serving_id), ("Learning", "new only"), ("Data", str(root))])
+    console().print("Prior history: retained")
+    if getattr(args, "show_diff", False):
+        for *_, diff in changes:
+            print(diff)
+    if not confirm_install(config, args):
+        return
+    config.save(root)
+    store = Store(root)
+    registry.migrate(config, store)
+    for found in refs:
+        if found.upstream == config.upstream:
+            registry.register(config, store, found.serving_id, found)
+    registry.set_learning(store, ref.serving_id, "new")
+    finish_initialization(config, args, root, changes)
+
+
+def upstream_model_ids(url):
+    with httpx.Client(trust_env=False, timeout=5) as client:
+        response = client.get(url.rstrip("/") + "/models")
+        response.raise_for_status()
+        return [
+            m["id"]
+            for m in response.json().get("data", [])
+            if isinstance(m.get("id"), str)
+        ]
+
+
+def finish_initialization(config, args, root, changes):
+    from . import agents, launchd
+
+    # A reinstall after `songe uninstall` (which pauses) learns again.
+    Store(private_dir(root)).set("paused", False)
+    with step("Starting service", "Service running · starts at login"):
+        launchd.install(
+            config, root, args.launchd_target, activate=args.launchd_target is None
+        )
+        if args.launchd_target is None:
+            deadline = time.monotonic() + config.upstream_timeout
+            while True:
+                if LocalClient(root, config).snapshot()["service_running"]:
+                    break
+                if time.monotonic() >= deadline:
+                    # Do not leave a service that restarts every ten seconds.
+                    launchd.remove(None, activate=True, root=root)
+                    raise RuntimeError(
+                        f"Service did not start · is port {config.port} in use? "
+                        f"· agent settings unchanged · see {root / 'songe.log'}"
+                    )
+                time.sleep(config.guard_max_interval)
+    # The newly started service can already have migrated its owned entries.
+    changes = [
+        change
+        for change in changes
+        if not change[0].exists()
+        or json.loads(change[0].read_bytes()) != json.loads(change[2])
+    ]
+    names = sorted({agent_name(path) for path, *_ in changes})
+    with step(
+        "Connecting " + (", ".join(names) or "agents"),
+        "Connected " + ", ".join(names) if names else "Agent settings unchanged",
+    ):
+        agents.apply(changes, root)
+        agents.migrate(config, root)
+    result(f"Ready · http://127.0.0.1:{config.port}/v1")
+    console().print()
+    console().print("Use your agent as usual · learning starts when idle")
+    facts(
+        [
+            (f"{NAME} open", "dashboard"),
+            (f"{NAME} status", "what it is doing"),
+            (f"{NAME} pause", "stop learning"),
+            (f"{NAME} uninstall", "remove everything"),
+        ]
+    )
+
+
+def agent_name(path):
+    """opencode or pi, from the configuration file Songe edits."""
+    return "opencode" if "opencode" in str(path) else "pi"
+
+
+def require_stopped_worker(root):
+    lease = (root / "worker.lock").open("a+")
+    deadline = time.monotonic() + 6
+    while True:
+        try:
+            acquire_lock(lease)
+            return lease
+        except BlockingIOError:
+            if time.monotonic() >= deadline:
+                lease.close()
+                raise RuntimeError("Worker busy · data preserved") from None
+            time.sleep(0.1)
+
+
+@contextmanager
+def require_stopped(root, timeout=6):
+    with ExitStack() as leases:
+        for name in ("serve", "worker", "experience"):
+            lease = leases.enter_context((root / f"{name}.lock").open("a+"))
+            deadline = time.monotonic() + timeout
+            while True:
+                try:
+                    acquire_lock(lease)
+                    break
+                except BlockingIOError:
+                    if time.monotonic() >= deadline:
+                        raise RuntimeError(f"{name} running · data preserved") from None
+                    time.sleep(0.1)
+        yield
+
+
+def default_choice(args):
+    """--make-default forces, --keep-default leaves it, otherwise automatic."""
+    if getattr(args, "make_default", False):
+        return True
+    if getattr(args, "keep_default", False):
+        return False
+    return None
+
+
+def main(argv=None):
+    args = parser().parse_args(argv)
+    root = args.data_dir.expanduser().resolve()
+    try:
+        config = Config.load(root)
+        command = args.command
+        local = LocalClient(root, config)
+        if command not in {"init", "uninstall", "serve"} and catch_up(root, config):
+            # Already printed once by catch_up; don't repeat it in the status.
+            os.environ["SONGE_NOTICE_SHOWN"] = "1"
+        if command == "init":
+            from .storage import foreign_entries
+
+            if not (root / "config.toml").exists() and foreign_entries(root):
+                raise ValueError(
+                    f"Data directory has other files · {root}"
+                    " · choose an empty or new --data-dir"
+                )
+        if command in {"init", "serve", "uninstall"} or (
+            command == "sleep" and args.dry_run
+        ):
+            store = Store(private_dir(root))
+        if command == "init":
+            initialize(args, root)
+        elif command == "serve":
+            if not config.model and not config.exposed_models:
+                raise ValueError("Uninitialized · songe init")
+
+            with (root / "serve.lock").open("a+") as probe:
+                try:
+                    acquire_lock(probe)
+                except BlockingIOError:
+                    print(
+                        f"{NAME} running"
+                        f" · http://127.0.0.1:{config.port}\n"
+                        f"status  {NAME} status · {NAME} open"
+                    )
+                    return 0
+            from . import agents
+
+            agents.migrate(config, root)
+            import uvicorn
+
+            from .proxy import create_app
+            from .schedule import ModelScheduler
+            from .telemetry import configure
+            from .upstream import create
+
+            configure(root)
+            if hasattr(signal, "SIGUSR2"):
+                import faulthandler
+
+                # `kill -USR2 <pid>` writes every thread's stack for diagnosis.
+                faulthandler.register(
+                    signal.SIGUSR2,
+                    open(root / "stacks.txt", "a", encoding="utf-8"),
+                    all_threads=True,
+                )
+            upstream = create(config, root)
+            scheduler = ModelScheduler(config, store, upstream)
+            server = uvicorn.Server(
+                uvicorn.Config(
+                    create_app(config, store, scheduler=scheduler),
+                    host="127.0.0.1",
+                    port=config.port,
+                    access_log=False,
+                    log_level="warning",
+                )
+            )
+            scheduler.shutdown = lambda: setattr(server, "should_exit", True)
+            server.run()
+            if getattr(scheduler, "upgrade_exit", False):
+                # Non-zero so systemd (Restart=on-failure) restarts it too.
+                return 3
+        elif command == "doctor":
+            if doctor(config, root, local):
+                return 1
+        elif command == "tui":
+            from .tui import run
+
+            run(root)
+        elif command in {"pause", "resume"}:
+            local.control(command)
+            result("Learning paused" if command == "pause" else "Learning resumed")
+        elif command == "open":
+            if not local.snapshot()["service_running"]:
+                error("Songe is stopped", f"run  {NAME} serve")
+                return 1
+            url = f"http://127.0.0.1:{config.port}/"
+            webbrowser.open(url)
+            result(f"Dashboard · {url}")
+        elif command == "undo":
+            local.control(
+                "undo",
+                **({"model": args.model} if args.model else {}),
+                **({"version": args.version} if args.version else {}),
+            )
+            result(
+                "Previous version restored" + (f" · {args.model}" if args.model else "")
+            )
+        elif command == "models":
+            if args.model and args.level:
+                # What it learns from is Songe's decision; this only says
+                # whether Dreams start on their own.
+                local.control("auto_dream", model=args.model, on=args.level == "on")
+                result(f"{args.model} · auto-dream {args.level}")
+                console().print()
+            elif args.model or args.level:
+                raise UsageError(f"{NAME} models <model> on|off")
+            data = local.snapshot()
+            print_models(data.get("models", []), data=data)
+        elif command == "sleep":
+            if args.dry_run:
+                from .sleep.worker import isolated
+
+                print(json.dumps(isolated(config, store, dry_run=True), indent=2))
+            else:
+                # --now is the default; the flag stays for older scripts.
+                local.control("sleep_now")
+                result(f"Learning requested · {NAME} status")
+        elif command == "forget":
+            if confirm("Delete experience and examples?", args.yes):
+                local.control("forget", confirm=True)
+                result(
+                    f"Conversations deleted · learning paused · {NAME} resume to continue"
+                )
+        elif command == "uninstall":
+            from . import agents, launchd
+
+            store.set("paused", True)
+            launchd.remove(
+                args.launchd_target, activate=args.launchd_target is None, root=root
+            )
+            local.control("shutdown")
+            purged = False
+            # A streaming answer or a version being applied can take a while
+            # to end; six seconds left the service removed but agents wired.
+            with require_stopped(root, timeout=30):
+                conflicts = agents.restore(root)
+                if args.purge and confirm(
+                    "Delete Songe-created models and all Songe data?", args.yes
+                ):
+                    from .upstream.cleanup import purge
+
+                    asyncio.run(purge(config, store))
+                    from .artifacts.storage import purge_roots
+
+                    purge_roots(store)
+                    with store.connect() as db:
+                        versions = [
+                            dict(r) for r in db.execute("SELECT * FROM versions")
+                        ]
+                    for version in versions:
+                        artifact = Path(version["artifact"])
+                        from .artifacts.runtime import remove_owned
+
+                        remove_owned(artifact, store.get("installation_id"))
+                    # Windows cannot delete open lease files. Remove the
+                    # config/data while locked, then close the empty leases.
+                    # An agent setting you changed since init is left as it
+                    # is; only the backups of the originals stay behind.
+                    from .storage import owned_entry
+
+                    keep = {"serve.lock", "worker.lock", "experience.lock"} | (
+                        {"backups", "agent-backups.json"} if conflicts else set()
+                    )
+                    for path in root.iterdir():
+                        if owned_entry(path.name) and path.name not in keep:
+                            shutil.rmtree(path) if path.is_dir() else path.unlink()
+                    purged = True
+            kept = []
+            if purged:
+                from .storage import foreign_entries
+
+                for name in ("serve", "worker", "experience"):
+                    (root / f"{name}.lock").unlink(missing_ok=True)
+                kept = foreign_entries(root) or (["backups"] if conflicts else [])
+                if not kept:
+                    root.rmdir()
+            result("Service removed")
+            result(
+                "Agent configurations restored"
+                if not conflicts
+                else "Agent configurations restored · conflicts preserved"
+            )
+            if purged:
+                result("Songe data removed")
+                if kept:
+                    facts(
+                        [
+                            (
+                                "Kept",
+                                (
+                                    "backups of your agent settings"
+                                    if conflicts
+                                    else "files not created by Songe"
+                                )
+                                + f" · {root}",
+                            )
+                        ]
+                    )
+            if conflicts:
+                facts(
+                    [
+                        ("Preserved", ", ".join(conflicts)),
+                        ("Originals", "retained in backups"),
+                    ]
+                )
+            result("Songe uninstalled")
+            if not purged:
+                facts(
+                    [
+                        ("Data kept", str(root)),
+                        ("Delete", f"{NAME} uninstall --purge"),
+                    ]
+                )
+        else:
+            print_status(local.snapshot())
+    except (
+        OSError,
+        sqlite3.Error,
+        ValueError,
+        RuntimeError,
+        subprocess.SubprocessError,
+        httpx.HTTPError,
+    ) as exc:
+        error(exc, f"usage  {exc.usage}" if isinstance(exc, UsageError) else None)
+        return 1
+    return 0
+
+
+def print_models(models, *, data=None):
+    models_table(models, data=data)
+
+
+def print_status(data):
+    status(data)
+
+
+def measured_hardware():
+    from .platform import current
+
+    device = current()
+    memory = device.memory()
+    accelerators = device.accelerators()
+    return (
+        device.name,
+        memory.total,
+        memory.available,
+        ", ".join(
+            f"{a.kind} {a.name}"
+            # Apple GPUs share system memory, already shown on the Memory line.
+            + (
+                ""
+                if a.kind == "metal" or not a.memory_total
+                else f" · {a.memory_free / 1e9:.1f} of {a.memory_total / 1e9:.1f} GB free"
+            )
+            for a in accelerators
+        )
+        or "none · CPU serving",
+    )
+
+
+def last_errors(root):
+    """The recorded learning error and retry count, per model when scoped."""
+    from .api import ReadOnlyStore
+    from .wording import stamp
+
+    try:
+        with ReadOnlyStore(root).connect() as db:
+            rows = db.execute(
+                "SELECT key, value FROM state WHERE key IN ('child_error', 'failures')"
+                " OR key LIKE 'model:%:child_error' ORDER BY key"
+            ).fetchall()
+    except sqlite3.Error:
+        return []
+    lines = []
+    for key, raw in rows:
+        value = json.loads(raw)
+        if not value:
+            continue
+        model = key.removeprefix("model:").rpartition(":")[0]
+        if key.endswith("child_error"):
+            text = str(value).removesuffix(" · songe doctor")
+            lines.append(f"Last error: {text}" + (f" · {model}" if model else ""))
+        elif isinstance(value, dict) and value.get("count"):
+            at = value.get("at")
+            lines.append(
+                f"Failures: {value['count']}"
+                + (f" · last {stamp(at)}" if isinstance(at, (int, float)) else "")
+            )
+    return lines
+
+
+def doctor(config, root, local):
+    from . import agents
+
+    problems = []
+    try:
+        name, total, available, accelerator = measured_hardware()
+    except (OSError, ValueError, KeyError, subprocess.SubprocessError) as exc:
+        name, total, available, accelerator = (
+            sys.platform,
+            None,
+            None,
+            f"probe failed: {exc}",
+        )
+    print(
+        f"Platform: {name}, {host_platform.machine()}, Python {host_platform.python_version()}; "
+        + (
+            "supported"
+            if name in {"darwin", "linux", "win32", "windows"}
+            else "unsupported"
+        )
+    )
+    print(f"Accelerator: {accelerator}")
+    print(
+        f"Memory: {available / 1e9:.1f} of {total / 1e9:.1f} GB free"
+        if available is not None and total is not None
+        else "Memory: —"
+    )
+    tools = [
+        f"{name}={path}"
+        for name in ("lms", "ollama", "llama-server", "mlx_lm", "vllm")
+        if (path := shutil.which(name))
+    ]
+    try:
+        with httpx.Client(trust_env=False, timeout=1) as client:
+            response = client.get(config.upstream_url.rstrip("/") + "/models")
+            response.raise_for_status()
+            models = response.json()["data"]
+            if not isinstance(models, list):
+                raise ValueError("Model listing: list required")
+        endpoint = f"{len(models)} models at {config.upstream_url}"
+    except (httpx.HTTPError, ValueError, KeyError) as exc:
+        endpoint = f"{config.upstream_url} unavailable · {type(exc).__name__}"
+        problems.append("upstream")
+    print(
+        f"Upstreams: {len(tools)} executables"
+        + (f" ({', '.join(tools)})" if tools else "")
+        + f"; {endpoint}"
+    )
+    configured, invalid = [], []
+    try:
+        for kind, path in agents.targets():
+            try:
+                raw = json.loads(path.read_text(encoding="utf-8"))
+                providers = raw.get("providers", raw.get("provider", {}))
+                provider = providers.get(NAME, {})
+                url = (
+                    provider.get("settings", provider.get("options", {})).get("baseURL")
+                    if kind == "opencode"
+                    else provider.get("baseUrl")
+                )
+                if url == f"http://127.0.0.1:{config.port}/v1":
+                    configured.append(kind)
+                else:
+                    invalid.append(f"{kind}: provider URL differs")
+            except (OSError, ValueError, AttributeError):
+                invalid.append(f"{kind}: unreadable configuration")
+    except ValueError as exc:
+        invalid.append(str(exc))
+    problems += invalid
+    print(
+        f"Agents: {len(configured)} configured"
+        + (f" ({', '.join(configured)})" if configured else f"; {NAME} init")
+        + (f"; {', '.join(invalid)}" if invalid else "")
+    )
+    try:
+        data = local.snapshot()
+        print(
+            f"Service: running on 127.0.0.1:{config.port}, {data['state']}"
+            if data["service_running"]
+            else f"Service: stopped · 127.0.0.1:{config.port} · {NAME} serve"
+        )
+        if not data["service_running"]:
+            problems.append("service")
+        if data.get("upgrade_notice") and not os.environ.get("SONGE_NOTICE_SHOWN"):
+            print(data["upgrade_notice"])
+    except (OSError, sqlite3.Error, ValueError, RuntimeError, httpx.HTTPError) as exc:
+        print(f"Service: unhealthy on 127.0.0.1:{config.port} ({exc})")
+        problems.append("service")
+    for line in last_errors(root):
+        print(line)
+    print(f"Log: {root / 'songe.log'}")
+    path = Path(
+        config.models_dir
+        if config.upstream == "lmstudio" and config.models_dir
+        else config.ollama_models_dir
+        if config.upstream == "ollama" and config.ollama_models_dir
+        else config.model_ref.get("path") or config.model or root
+    )
+    while not path.exists() and path != path.parent:
+        path = path.parent
+    try:
+        disk = shutil.disk_usage(path)
+        artifact_bytes = (
+            sum(p.stat().st_size for p in Path(config.model).rglob("*") if p.is_file())
+            if config.model and Path(config.model).exists()
+            else None
+        )
+        size = (
+            f"; model {artifact_bytes / 1e9:.1f} GB"
+            if artifact_bytes is not None
+            else f"; model path missing · {NAME} init"
+            if config.model
+            else f"; uninitialized · {NAME} init"
+        )
+        print(
+            f"Disk: {disk.free / 1e9:.1f} of {disk.total / 1e9:.1f} GB free at {path}{size}"
+        )
+    except OSError as exc:
+        print(f"Disk: unavailable · {path} · {exc}")
+    return problems

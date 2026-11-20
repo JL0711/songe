@@ -1,0 +1,8 @@
+now     Waiting for memory · retries automatically
+next    Measure training needs for Qwen3.5-4B · when idle
+
+  Model               Auto-dream    Status
+  Qwen3.5-4B          On            Waiting for memory
+  LFM3-1.7B           Off           Not supported yet · Architecture lfm3 not supported yet by mlx
+  nomic-embed-text    Off           Not supported yet · Embedding model
+  Granite-3B          On            No conversations yet
