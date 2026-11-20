@@ -5,6 +5,7 @@ import gc
 import json
 import logging
 import math
+import re
 import signal
 import time
 from dataclasses import replace
@@ -106,14 +107,19 @@ class Journal:
         self.root, self.check, self.store, self.slice_id = root, check, store, slice_id
         self.phase, self.units = "record", 0
 
+    def path(self, name):
+        # A unit name may carry an id like "original:sig" or "practice:x#v1";
+        # Windows forbids ":" (and a few others) in file names.
+        return self.root / (re.sub(r'[<>:"/\\|?*]', "_", name) + ".json")
+
     def load(self, name, default):
-        path = self.root / (name + ".json")
+        path = self.path(name)
         return (
             json.loads(path.read_text(encoding="utf-8")) if path.exists() else default
         )
 
     def commit(self, name, value):
-        write_json(self.root / (name + ".json"), value)
+        write_json(self.path(name), value)
         self.units += 1
         # Keep ended=NULL until the whole slice exits, including on a crash.
         with self.store.connect() as db:
@@ -998,7 +1004,7 @@ def run(config, store, slice_seconds=None, sizing=None):
             # A rerun of this strength must build it again, not trust records
             # of files that are gone.
             for name in (f"scaled-{scale}", f"fused-{scale}"):
-                (journal.root / f"{name}.json").unlink(missing_ok=True)
+                journal.path(name).unlink(missing_ok=True)
 
         def scaled(scale):
             # A strength already measured in an earlier slice still counts in

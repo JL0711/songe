@@ -43,6 +43,13 @@ def _forget(key):
             pass
 
 
+def close_connections():
+    """Close this thread's cached connections (Windows cannot delete or
+    rename a database file that is open; uninstall --purge removes it)."""
+    for key in list(_CONNECTIONS.__dict__.get("cache", {})):
+        _forget(key)
+
+
 def _cached(path):
     """This thread's open connection to `path`, reopened if the file was
     replaced or removed since. Least recently used ones beyond a few close."""

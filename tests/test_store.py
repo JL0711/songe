@@ -1,3 +1,5 @@
+import sys
+
 import pytest
 
 from songe.config import Config
@@ -208,6 +210,7 @@ def test_nested_connect_does_not_commit_the_callers_transaction(store):
     assert store.get("outer") is None
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="Windows cannot replace a database file that is open")
 def test_a_replaced_database_file_is_reopened(store):
     with store.connect() as before:
         pass

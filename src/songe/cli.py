@@ -899,6 +899,10 @@ def main(argv=None):
                     keep = {"serve.lock", "worker.lock", "experience.lock"} | (
                         {"backups", "agent-backups.json"} if conflicts else set()
                     )
+                    # This process's own open database handles go first.
+                    from .log import close_connections
+
+                    close_connections()
                     for path in root.iterdir():
                         if owned_entry(path.name) and path.name not in keep:
                             shutil.rmtree(path) if path.is_dir() else path.unlink()
