@@ -1,3 +1,5 @@
+[![Songe: a bed on the moon, and the command pip install songe](https://souslabs.ai/assets/songe-share-v1.png)](https://souslabs.ai/songe)
+
 # Songe
 
 A local model that learns from how you use it.
