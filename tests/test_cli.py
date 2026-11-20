@@ -323,3 +323,30 @@ def test_a_setting_from_a_newer_version_does_not_stop_every_command(tmp_path):
     path = tmp_path / "config.toml"
     path.write_text(path.read_text() + "\nfrom_the_future = 1\n")
     assert Config.load(tmp_path).port == Config().port
+
+
+def test_init_applies_the_reviewed_change_after_the_new_service_edits_opencode(tmp_path, config, monkeypatch):
+    """Live (first real install): init started the service, the service
+    updated opencode.json (context lengths), and init stopped with "Agent
+    configuration changed since review"."""
+    import json as _json
+    from types import SimpleNamespace
+
+    from songe import agents, cli, launchd
+
+    monkeypatch.setattr(agents.Path, "home", lambda: tmp_path)
+    monkeypatch.setattr(launchd, "install", lambda *a, **k: None)
+    path = tmp_path / ".config/opencode/opencode.json"
+    path.parent.mkdir(parents=True)
+    path.write_text(_json.dumps({"provider": {}}), encoding="utf-8")
+    root = tmp_path / "data"
+    root.mkdir()
+    config.public_model = "songe/granite"
+    changes = agents.proposed(config, root=root)
+    assert any(c[0] == path for c in changes)
+    # The newly started service writes the file first.
+    path.write_text(_json.dumps({"provider": {}, "theme": "user-or-service"}), encoding="utf-8")
+    args = SimpleNamespace(launchd_target=tmp_path / "plist", make_default=False, keep_default=False)
+    cli.finish_initialization(config, args, root, changes, lambda: agents.proposed(config, root=root))
+    written = _json.loads(path.read_text(encoding="utf-8"))
+    assert written["theme"] == "user-or-service" and "songe" in _json.dumps(written["provider"])

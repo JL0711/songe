@@ -349,7 +349,10 @@ def initialize(args, root):
                 for model in ids:
                     registry.register(config, existing, model)
                 agents.migrate(config, root, update_agents=False)
-                finish_initialization(config, args, root, changes)
+                finish_initialization(
+                    config, args, root, changes,
+                    lambda: agents.proposed(config, default=default_choice(args), root=root),
+                )
                 return
         detail = "".join(f"\n  {line}" for line in skipped)
         raise ValueError(
@@ -594,7 +597,10 @@ def initialize(args, root):
     agents.migrate(config, root, update_agents=False)
     # Recording starts now; the scheduler measures this machine in the first
     # idle gap, under the same memory, battery and traffic rules as training.
-    finish_initialization(config, args, root, changes)
+    finish_initialization(
+        config, args, root, changes,
+        lambda: agents.proposed(config, default=default_choice(args), opencode_v2=v2, root=root),
+    )
 
 
 def preenable_model(args, root, config, ref, refs):
@@ -625,7 +631,10 @@ def preenable_model(args, root, config, ref, refs):
         if found.upstream == config.upstream:
             registry.register(config, store, found.serving_id, found)
     registry.set_learning(store, ref.serving_id, "new")
-    finish_initialization(config, args, root, changes)
+    finish_initialization(
+        config, args, root, changes,
+        lambda: agents.proposed(proposal, default=default_choice(args), root=root),
+    )
 
 
 def upstream_model_ids(url):
@@ -639,7 +648,7 @@ def upstream_model_ids(url):
         ]
 
 
-def finish_initialization(config, args, root, changes):
+def finish_initialization(config, args, root, changes, repropose=None):
     from . import agents, launchd
 
     # A reinstall after `songe uninstall` (which pauses) learns again.
@@ -661,6 +670,19 @@ def finish_initialization(config, args, root, changes):
                         f"· agent settings unchanged · see {root / 'songe.log'}"
                     )
                 time.sleep(config.guard_max_interval)
+    # The newly started service writes agent settings itself (its own
+    # entries, context lengths), so a reviewed file may have changed since
+    # (live: "Agent configuration changed since review" right after "Service
+    # running"). The same reviewed change is proposed again on top of what
+    # the file holds now; a file nobody touched keeps its reviewed proposal.
+    if repropose is not None:
+        moved = {
+            path for path, original, *_ in changes
+            if (path.read_bytes() if path.exists() else None) != original
+        }
+        if moved:
+            fresh = {change[0]: change for change in repropose()}
+            changes = [fresh.get(change[0], change) if change[0] in moved else change for change in changes]
     # The newly started service can already have migrated its owned entries.
     changes = [
         change
