@@ -82,7 +82,10 @@ def test_forget_clears_prompt_lessons(config, store):
     assert quick.active(store) == []
 
 
-async def test_the_proxy_adds_the_sessions_lessons_to_the_system_prompt(config, store):
+@pytest.mark.parametrize("session_header", [None, "x-session-affinity", "x-session-id"])
+async def test_the_proxy_adds_the_sessions_lessons_to_the_system_prompt(
+    config, store, session_header
+):
     import httpx
 
     from tests.test_proxy import pair, version
@@ -113,19 +116,41 @@ async def test_the_proxy_adds_the_sessions_lessons_to_the_system_prompt(config, 
         app.router.lifespan_context(app),
         httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://127.0.0.1") as client,
     ):
-        await client.post("/v1/chat/completions", json=chat("commit this"))
+        first_session = {session_header: "first"} if session_header else {}
+        next_session = {session_header: "second"} if session_header else {}
+        await client.post(
+            "/v1/chat/completions", json=chat("commit this"), headers=first_session
+        )
         # A Quick Dream adds a lesson mid-session.
         add_signal(store, "c2", "Always keep the README under 30 lines.", revision=2)
         quick.quick_dream(store, config)
-        await client.post("/v1/chat/completions", json=chat(
-            "commit this", {"role": "assistant", "content": "ok"}, {"role": "user", "content": "again"}))
-        await client.post("/v1/chat/completions", json=chat("a new task"))
+        await client.post(
+            "/v1/chat/completions",
+            json=chat(
+                "commit this",
+                {"role": "assistant", "content": "ok"},
+                {"role": "user", "content": "again"},
+            ),
+            headers=first_session,
+        )
+        await client.post(
+            "/v1/chat/completions",
+            json=chat("commit this"),
+            headers=next_session,
+        )
+        await client.post(
+            "/v1/chat/completions", json=chat("a new task"), headers=next_session
+        )
     await upstream.aclose()
     system = [json.loads(r.content)["messages"][0]["content"] for r in seen]
     assert system[0].startswith("You are an agent.\n\n" + quick.BLOCK)
     assert "Conventional Commits" in system[0] and "README" not in system[0]
     assert system[1] == system[0]  # the session keeps its lessons
-    assert "README" in system[2]  # the next session gets the new ones
+    if session_header == "x-session-affinity":
+        assert "README" in system[2]  # Pi identifies a genuinely new session.
+    else:
+        assert system[2] == system[0]  # A generic request ID cannot change the pin.
+    assert "README" in system[3]
     # What Songe records is the agent's own request.
     assert store.exchanges()[0]["request"]["messages"][0]["content"] == "You are an agent."
 
