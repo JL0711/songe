@@ -151,6 +151,32 @@ def work_costs(config, calibration):
 
 
 SLICE_PAUSE_MAX = 300  # seconds between work slices, at most
+WORKER_ERR = "worker.err"  # the last learning child's stderr
+FAILED_NIGHT_RETRIES = 3  # a pressed Dream's failed nights retried, then a note
+
+
+def exit_reason(code, err_path, tail=600):
+    """Why a learning child ended with an error, in a line or two: its exit
+    code (or the signal that killed it) and the end of its stderr."""
+    import signal as signals
+
+    if code < 0:
+        # Unix signal numbers (Windows' signal module lacks most of them).
+        known = {2: "SIGINT", 6: "SIGABRT", 9: "SIGKILL", 11: "SIGSEGV", 15: "SIGTERM"}
+        try:
+            name = known.get(-code) or signals.Signals(-code).name
+        except ValueError:
+            name = f"signal {-code}"
+        why = f"killed by {name}" + (" (out of memory?)" if name == "SIGKILL" else "")
+    else:
+        why = f"exit code {code}"
+    try:
+        text = Path(err_path).read_bytes()[-4000:].decode("utf-8", "replace")
+    except OSError:
+        text = ""
+    lines = [line for line in text.strip().splitlines() if line.strip()]
+    last = next((line for line in reversed(lines) if not line.startswith(" ")), "")
+    return why + (f" · {last.strip()[:tail]}" if last else "")
 
 
 def work_unit_seconds(config, calibration):
@@ -756,10 +782,20 @@ class Scheduler:
 
             count = (self.store.get("failures") or {}).get("count", 0) + 1
             self.store.set("failures", {"count": count, "at": time.time()})
+            why = exit_reason(code, self.store.root / WORKER_ERR)
+            # The worker's own record of a Python error is the more precise;
+            # otherwise the exit itself says why.
+            if not self.store.get("child_error"):
+                self.store.set("child_error", f"Learning stopped: {why}")
+            logger.warning("worker_failed %s", why)
             self.store.event(
                 "error",
-                f"failed · retry in {duration(retry_wait(count))} · songe doctor",
+                f"failed ({why.splitlines()[0][:120]}) · retry in {duration(retry_wait(count))} · songe doctor",
             )
+        err = getattr(self, "worker_err", None)
+        if err is not None:
+            err.close()
+            self.worker_err = None
         self.note_progress()
         self.guard_stop.set()
         if self.guard_task:
@@ -1126,11 +1162,15 @@ class Scheduler:
                     if upgrade_calibration
                     else "learning cycle in an idle gap",
                 )
+                # The child's stderr is kept: a crash outside Python's
+                # logging (a CUDA error, a kill) left no trace at all (live,
+                # Inkling on Modal: "failed" with no reason anywhere).
+                self.worker_err = open(self.store.root / WORKER_ERR, "wb")  # noqa: SIM115
                 self.process = await asyncio.create_subprocess_exec(
                     *owned_command(argv),
                     **process_options(),
                     stdout=asyncio.subprocess.DEVNULL,
-                    stderr=asyncio.subprocess.DEVNULL,
+                    stderr=self.worker_err,
                 )
                 self.guard_stop = threading.Event()
                 loop = asyncio.get_running_loop()
@@ -2160,12 +2200,6 @@ class ModelScheduler(Scheduler):
         learner = self.installation_store.scoped(model)
         if learner.get("growth_requested") and calibrating:
             learner.set("growth_requested", None)
-        if len(learner.nights()) > launch["nights"]:
-            learner.set("dream_growth", None)
-            learner.set("memory_wait", None)
-            learner.set("dream_memory_waits", None)
-            learner.set("dream_capacity_edges", None)
-            return  # It is under way: unfinished nights resume on their own.
         if stopped_by in {"cancelled", "paused"} or self.installation_store.get("paused", False):
             return  # The user stopped it.
 
@@ -2182,6 +2216,28 @@ class ModelScheduler(Scheduler):
             learner.set("dream_stopped", {"kind": "deep", "at": time.time(), "reason": "training",
                                           "detail": str(detail)[:300], "kept": counts(learner)["kept"]})
             logger.warning("deep_dream_stopped %s: %s", model, detail)
+
+        nights = learner.nights()
+        if len(nights) > launch["nights"]:
+            if nights[-1]["status"] == "failed":
+                # A failed night does not resume on its own, and with
+                # auto-dream off nothing else starts it: the retry announced
+                # ("failed · retry in 5m") is this request, kept armed (the
+                # failure back-off sets when). A few failures in a row end in
+                # a note saying why (live, Inkling: "retry in 5m", then
+                # nothing for an hour and no word).
+                failures = (learner.get("failures") or {}).get("count", 0)
+                if failures >= FAILED_NIGHT_RETRIES:
+                    why = learner.get("child_error") or "an error stopped it"
+                    stop(f"training failed {failures} times in a row: {why}")
+                    return
+                again()
+                return
+            learner.set("dream_growth", None)
+            learner.set("memory_wait", None)
+            learner.set("dream_memory_waits", None)
+            learner.set("dream_capacity_edges", None)
+            return  # It is under way: unfinished nights resume on their own.
 
         measured = any(r.get("sequence") for r in (learner.get("calibration") or {}).get("rows", []))
         if memory_stop and calibrating and measured:
