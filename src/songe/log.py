@@ -179,6 +179,9 @@ CREATE TABLE IF NOT EXISTS practice (
  id TEXT NOT NULL, model_id TEXT NOT NULL, signal_id TEXT NOT NULL,
  payload TEXT NOT NULL, kept INTEGER NOT NULL, "drop" TEXT, created REAL NOT NULL,
  PRIMARY KEY(id,model_id));
+-- Sessions whose recordings were deleted for the size limit after they were
+-- learned from (recordings.keep_under); their signals and practice stay.
+CREATE TABLE IF NOT EXISTS pruned_sessions (session TEXT PRIMARY KEY, at REAL NOT NULL);
 """
 
 
@@ -483,9 +486,17 @@ class Store:
             # Hashing and sharing happen here, in the recording thread, never
             # on the request path.
             skeleton, refs = parts.pack(db, request, parts.REQUEST_LISTS)
+            # An exchange id is never given out twice: watermarks and read
+            # signals refer to ids, and deleting the newest recordings (size
+            # limit, forget) would otherwise let SQLite hand them out again.
+            high = db.execute(
+                "SELECT value FROM state WHERE key='exchange_id_high'"
+            ).fetchone()
+            last = db.execute("SELECT MAX(id) FROM exchanges").fetchone()[0] or 0
             cur = db.execute(
-                "INSERT INTO exchanges(created,path,request,response,status,complete,binding,recorded_at,refs) VALUES (?,?,?,?,?,?,?,?,?)",
+                "INSERT INTO exchanges(id,created,path,request,response,status,complete,binding,recorded_at,refs) VALUES (?,?,?,?,?,?,?,?,?,?)",
                 (
+                    max(last, json.loads(high[0]) if high else 0) + 1,
                     started if started is not None else time.time(),
                     path,
                     skeleton,
@@ -780,6 +791,12 @@ class Store:
                 "INSERT OR REPLACE INTO state VALUES ('forgotten_at',?)",
                 (json.dumps(time.time()),),
             )
+            # Later recordings take ids above every one deleted here.
+            db.execute(
+                "INSERT INTO state VALUES ('exchange_id_high',"
+                " (SELECT json(MAX(COALESCE(MAX(id),0), COALESCE((SELECT CAST(value AS INTEGER) FROM state WHERE key='exchange_id_high'),0))) FROM exchanges))"
+                " ON CONFLICT(key) DO UPDATE SET value=excluded.value"
+            )
             db.execute("DELETE FROM exchanges")
             db.execute("DELETE FROM pool")
             db.execute("DELETE FROM steps")
@@ -800,6 +817,7 @@ class Store:
             db.execute("DELETE FROM signals")
             db.execute("DELETE FROM reading_cache")
             db.execute("DELETE FROM practice")
+            db.execute("DELETE FROM pruned_sessions")
             # Cycle records keep their counts; example text quotes the
             # conversations and goes (docs/CONTRACTS.md, Integration decisions).
             for night_id, raw in db.execute("SELECT id, record FROM nights").fetchall():
