@@ -253,6 +253,7 @@ def practice_wait(config, store, supported):
 
 def activity(config, store, scheduler, training, models, *, live, ready=None):
     from .models.library import model_name
+    from .wording import flow_state
 
     paused = bool(store.get("paused", False))
     threshold = getattr(
@@ -484,6 +485,15 @@ def activity(config, store, scheduler, training, models, *, live, ready=None):
             next_text = (
                 f"Pick a Songe model in your agent · {name} learns from conversations"
             )
+    elif target and (disk := flow_state(reason)).startswith("waiting for disk space · "):
+        # Short of disk space (admit_storage's disk_wait), pressed or not:
+        # nothing starts until there is room, so what to free and where (live:
+        # "Your Deep Dream is pending · it starts on its own" for 3.5 hours).
+        next_text = (
+            "Free up disk space · "
+            + disk.removeprefix("waiting for disk space · ")
+            + " · it starts on its own"
+        )
     elif target and store.get("requested_model") == target["id"]:
         # A pressed Deep Dream is pending: never "press Dream" again.
         next_text = "Your Deep Dream is pending · it starts on its own"

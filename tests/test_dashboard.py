@@ -172,6 +172,30 @@ def test_pause_offline_and_memory_retry(config, store):
     assert result["now"] == "waiting · service stopped · songe serve"
 
 
+@pytest.mark.parametrize("pressed", [True, False])
+def test_a_deep_dream_short_of_disk_space_says_what_to_free(config, store, pressed):
+    """Live (Windows, Ollama, qwen3:4b): a pressed Deep Dream waited 3.5 hours
+    for disk space while Next said "Your Deep Dream is pending · it starts on
+    its own". Pressed or not, nothing starts until there is room."""
+    config.learning = "dreams"
+    registry.migrate(config, store)
+    registry.set_learning(store, config.base_identifier, "all")
+    registry.support(store, config.base_identifier, "trainable")
+    models = registry.summaries(config, store)
+    if pressed:
+        store.set("requested_model", config.base_identifier)
+        store.set("requested_sleep", True)
+    # As admit_storage and the scheduler leave it when they turn the run down.
+    wait = "Needs 42.8 GB free on D:\\; 41.7 GB available"
+    store.scoped(config.base_identifier).set("disk_wait", wait)
+    worker = scheduler(config)
+    worker.reason = wait
+    result = activity(config, store, worker, None, models, live=True)
+    assert result["next"] == (
+        "Free up disk space · 41.7 GB free on D:\\, needs 42.8 GB · it starts on its own"
+    )
+
+
 @pytest.mark.parametrize(
     "feedback,counts,expected",
     [
