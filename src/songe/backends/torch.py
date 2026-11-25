@@ -584,7 +584,9 @@ class TorchBackend:
         inputs = torch.tensor([prompt_ids], device=self.device)
         was_training = self.model.training
         self.model.eval()
-        started = time.monotonic()
+        # perf_counter, not monotonic: on Windows monotonic ticks every ~15.6 ms,
+        # so a small model's answer could take "0 s" and its speed divide by zero.
+        started = time.perf_counter()
         if state is not None or len(prompt_ids) > self._chunk():
             # A long prompt is read in chunks, as the teacher reads it: one
             # pass over the whole prompt can need far more memory than the
@@ -619,7 +621,7 @@ class TorchBackend:
                         ).to(self.device)
                     value = int(token.item())
                     if not tokens:
-                        prompt_seconds = time.monotonic() - started
+                        prompt_seconds = time.perf_counter() - started
                     tokens.append(value)
                     past, inputs = self._cache(out), token
                     if value in eos:
@@ -628,7 +630,7 @@ class TorchBackend:
             self.model.train(was_training)
         if not tokens:
             raise ValueError("Model generated no tokens")
-        seconds = time.monotonic() - started
+        seconds = time.perf_counter() - started
         return (
             tokens,
             self.tokenizer.decode(tokens, skip_special_tokens=True),

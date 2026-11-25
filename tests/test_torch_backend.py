@@ -175,6 +175,21 @@ def test_sampling_seed_base_and_interruption(backend):
     assert not backend.model.training
 
 
+def test_sampling_speed_does_not_divide_by_a_clock_that_has_not_ticked(
+    backend, monkeypatch
+):
+    # Windows' monotonic clock ticks about every 15.6 ms: a tiny model's whole
+    # answer can fit in one tick, and its speed divided by zero.
+    import time
+
+    monkeypatch.setattr(time, "monotonic", lambda: 1000.0)
+    for prompt in ([3, 8], [3]):
+        tokens, _, stats = backend.sample(prompt, seed=91)
+        assert stats.generation_tokens == len(tokens)
+        assert stats.generation_tps > 0
+        assert stats.prompt_tps > 0
+
+
 @pytest.mark.parametrize("kind", ["forward_kl", "reverse_kl", "jsd"])
 @pytest.mark.parametrize("top_k", [0, 3])
 def test_checkpointed_chunk_gradient_matches_dense_response_only(
