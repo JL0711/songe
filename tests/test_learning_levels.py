@@ -334,6 +334,18 @@ async def test_cancel_throws_the_dream_away_and_keeps_its_practice_untrained(lev
     assert await scheduler.cancel("other") == 0
 
 
+async def test_cancel_while_getting_ready_says_the_dream_was_cancelled(levels):
+    """Live run: Cancel while a pressed Deep Dream measured the machine (no
+    night yet) stopped the measuring, and answered "No Dream to cancel"."""
+    config, store, _ = levels
+    store.set("requested_model", "other")
+    store.set("requested_sleep", True)
+    scheduler = ModelScheduler(config, store, SimpleNamespace())
+    assert await scheduler.cancel("other") == 1
+    assert store.get("requested_model") is None
+    assert await scheduler.cancel("other") == 0
+
+
 async def test_a_manual_deep_dream_trains_with_auto_dream_off(levels):
     """Live run: with auto-dream off, Deep Dream said "nothing new to learn"
     though 110 practice scenes waited (the check ran before the request)."""
