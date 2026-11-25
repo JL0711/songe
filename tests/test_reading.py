@@ -238,6 +238,35 @@ def test_an_example_of_the_question_pasted_back_is_not_the_users_wish():
     assert P.turn_verdict({"standing": "yes", "kind": "once", "wish": "Use metric units."}, "everything in metric")[0] == "lasting"
 
 
+def test_a_wish_limited_to_now_is_not_a_standing_wish():
+    from songe.reading import prompts as P
+
+    # Live (Qwen3.8-27B): "today only reply fast" and "今天先别管 lint 了" were read as standing wishes.
+    fast = {"standing": "yes", "kind": "once", "wish": "Reply fast and short today."}
+    assert P.turn_verdict(fast, "today only reply fast, short short. deadline at 5") == ("task", "")
+    assert P.turn_verdict({"standing": "yes", "kind": "task", "wish": "Ignore lint today."}, "今天先别管 lint 了，下午 demo 要紧") == ("task", "")
+    assert P.turn_verdict({"standing": "yes", "kind": "once", "wish": "Use inline styles."}, "just this once inline styles are fine") == ("task", "")
+    assert P.turn_verdict({"standing": "yes", "kind": "once", "wish": "Answer in Chinese."}, "from today on answer in chinese") == ("lasting", "Answer in Chinese.")
+    assert P.turn_verdict({"standing": "yes", "kind": "once", "wish": "Answer in Chinese."}, "以后都用中文回答，今天开始") == ("lasting", "Answer in Chinese.")
+    assert P.turn_verdict({"standing": "yes", "kind": "once", "wish": "Put today's date at the top of every note."}, "put today's date at the top of every note")[0] == "lasting"
+    fy = {"standing": "yes", "kind": "once", "wish": "Start the fiscal year on February 1."}
+    assert P.turn_verdict(fy, "fiscal starts feb 1st!! FY27 ytd is from 2026-02-01 till today")[0] == "lasting"
+
+
+def test_a_lasting_wish_beside_a_mention_of_today_is_kept():
+    from songe.reading import prompts as P
+
+    # "Today" elsewhere in the message, or a wish said to last beyond today,
+    # does not make the wish a passing one.
+    tabs = {"standing": "yes", "kind": "task", "wish": "Use tabs, not spaces."}
+    assert P.turn_verdict(tabs, "I prefer tabs, not spaces. Today let us refactor utils.py")[0] == "lasting"
+    short = {"standing": "yes", "kind": "once", "wish": "Keep answers short."}
+    assert P.turn_verdict(short, "keep answers short, today and always")[0] == "lasting"
+    assert P.turn_verdict({"standing": "yes", "kind": "once", "wish": "Use no emojis."}, "no emojis ever, not just today")[0] == "lasting"
+    assert P.turn_verdict({"standing": "yes", "kind": "once", "wish": "Use tabs."}, "for now on use tabs")[0] == "lasting"
+    assert P.turn_verdict(short, "keep answers short today, deadline at 5") == ("task", "")
+
+
 def test_a_rule_sentence_carries_what_its_turn_was(store):
     # The rules find "Always ..." in the user's message by its shape; the
     # verdict on the turn it stands in goes with it (quick.suitable).
