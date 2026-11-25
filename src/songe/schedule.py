@@ -1761,6 +1761,8 @@ class ModelScheduler(Scheduler):
             unread = await self.quick_now(model)
             if unread == "no_model":
                 return {"started": False, "message": "Quick Dream can't start · no model is loaded in your model server · load it, then press Quick Dream"}
+            if unread == "memory":
+                return {"started": False, "message": "Quick Dream can't start · not enough free memory · close some apps, then press Quick Dream"}
             if unread == "nothing":
                 last = (self.installation_store.scoped(model).get("quick_last") or {}).get("at")
                 # The page puts `since` in the viewer's local time.
@@ -1891,34 +1893,46 @@ class ModelScheduler(Scheduler):
     async def quick_now(self, model):
         """Quick Dream now: the newest unread conversations within the budget,
         then the prompt lessons. Returns how many conversations it reads (or
-        None when a reading is already running: it continues)."""
+        None when a reading is already running: it continues), "nothing", or
+        why it cannot start ("no_model", "memory")."""
         from .reading import store as reading
 
         running = getattr(self, "dream_task", None)
         if getattr(self, "reading_task", None) or (running and not running.done()):
             return None
         learner = self.installation_store.scoped(model)
+
+        async def cannot_start(error):
+            # Said on the page and in the Dream history, never "started".
+            learner.set("quick_checked", {"at": time.time(), "nothing_new": False, "error": error})
+            from . import quick as quick_lessons
+
+            await asyncio.to_thread(
+                quick_lessons.record, learner,
+                {"added": [], "lessons": len(quick_lessons.active(learner)),
+                 "changes": {"added": [], "reworded": [], "dropped": []}},
+                time.time(), None, read=0, found=0, error=error)
+            return error
+
         unread = len(await asyncio.to_thread(reading.pending, learner))
         if unread:
             probe_reader = await self.reader_for(model)
             if probe_reader is None:
                 # Reading needs the model loaded in the model server (live: a
                 # press right after a restart said "started" and did nothing).
-                learner.set("quick_checked", {"at": time.time(), "nothing_new": False, "error": "no_model"})
-                from . import quick as quick_lessons
-
-                await asyncio.to_thread(
-                    quick_lessons.record, learner,
-                    {"added": [], "lessons": len(quick_lessons.active(learner)),
-                     "changes": {"added": [], "reworded": [], "dropped": []}},
-                    time.time(), None, read=0, found=0, error="no_model")
-                return "no_model"
+                return await cannot_start("no_model")
             await probe_reader.close()
         if not unread and learner.get("quick_seen") == await asyncio.to_thread(self.signals_seen, learner):
             # Nothing unread and nothing read since the last Quick Dream: say
             # so, on the notice and (lasting) on the dashboard.
             learner.set("quick_checked", {"at": time.time(), "nothing_new": True})
             return "nothing"
+        sample = await asyncio.to_thread(self.platform.memory)
+        if sample.pressure != "normal":
+            # Reading waits while memory is short (read_sessions): a press
+            # says so instead (live: pressure "warn", another copy of the
+            # model loaded; it said "started", read nothing, never said why).
+            return await cannot_start("memory")
         self.dream_task = asyncio.create_task(
             self.read_sessions(
                 force=True,

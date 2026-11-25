@@ -316,6 +316,41 @@ def test_every_quick_dream_joins_the_history_and_quiet_ones_share_a_chip(config,
     assert row[1]["repeat"] == 2 and row[1]["read"] == 2 and row[0]["error"] == "no_model"
 
 
+async def test_a_pressed_quick_dream_that_cannot_read_for_memory_says_so(config, store, monkeypatch):
+    """Live (macOS, memory pressure "warn" with another copy of the model
+    loaded): a pressed Quick Dream answered "Quick Dream started", read
+    nothing, and the page never said why."""
+    from pathlib import Path
+    from types import SimpleNamespace
+
+    from songe.cycle import dreams
+    from songe.models import registry
+    from tests.test_reading import record_session, scheduler_for
+
+    config.learning = "dreams"
+    registry.migrate(config, store)
+    registry.observe(config, store, "learner")
+    registry.set_learning(store, "learner", "all")
+    record_session(store)
+    learner = store.scoped("learner")
+    scheduler, asked = scheduler_for(config, store, monkeypatch, loaded=["learner"])
+    scheduler.platform.memory = lambda: SimpleNamespace(pressure="warn")
+    # Reading in an idle gap waits for memory without a word, as before.
+    assert await scheduler.read_sessions(quick=True, seconds=config.quick_read_seconds) == 0
+    assert learner.get("quick_checked") is None and learner.get(quick.HISTORY) is None
+    # Pressed: not "started", and the page says why (the now line and the Dream row).
+    reply = await scheduler.dream("learner", "quick")
+    assert reply == {"started": False, "message": "Quick Dream can't start · not enough free memory"
+                                                  " · close some apps, then press Quick Dream"}
+    assert learner.get("quick_checked")["error"] == "memory"
+    assert dreams(learner)[0]["error"] == "memory"
+    assert reading.pending(learner) and asked == []  # nothing was read
+    # The page's words for it (without them it falls back to "couldn't read").
+    page = json.loads((Path(quick.__file__).parent / "ui" / "wording.json").read_text(encoding="utf-8"))
+    for line in (page["quick_failed"]["memory"], page["quick_failed_card"]["memory"]):
+        assert "not enough free memory · close some apps" in line
+
+
 def test_the_dream_row_lists_quick_and_deep_dreams_with_seen(config, store):
     from songe.cycle import dreams, mark_seen
 
