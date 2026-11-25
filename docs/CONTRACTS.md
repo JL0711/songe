@@ -151,12 +151,16 @@ or by auto-dream:
   things, a change wanted for this answer only, new work, or a reaction. Only
   a standing wish becomes a note in the prompt at once, also when the split
   into parts read it as a new task. A change wanted once becomes a note when
-  the same wish comes up in a second conversation. New work and reactions do
-  not become notes. A sentence shaped like a rule stays a rule. The wish and
-  the lesson for such a message are the model's wording of what the user
-  wrote, checked in code (`rules.voiced`): one that names nothing the user
-  wrote is not used, and the user's own sentence, when the message is one
-  short sentence, is the note or the lesson in its place.
+  the same wish comes up in a second conversation; it is stored as a
+  correction for that, also when the split read it as a new task. After a plain
+  answer (no tool call), a turn the split read as saying something is wrong
+  or missing while the turn question read new work or a question (a
+  reminder: "Where's my ...?") waits the same way. Other new work and
+  reactions do not become notes. A sentence shaped like a rule stays a rule.
+  The wish and the lesson for such a message are the model's wording of what
+  the user wrote, checked in code (`rules.voiced`): one that names nothing
+  the user wrote is not used, and the user's own sentence, when the message
+  is one short sentence, is the note or the lesson in its place.
 - Practice needs the same evidence as a note (`quick.admitted`, one bar for
   both; training is harder to undo than a note). Where the user's turn was
   judged, Deep Dream writes scenes for a standing wish and for a rule of
