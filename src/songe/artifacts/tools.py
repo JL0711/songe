@@ -51,11 +51,27 @@ BINARIES = {
 }
 
 
+# Songe uses the source archive only for the two converters: the scripts, the
+# conversion package and gguf-py they import, and the chat templates some
+# architectures read. The rest (the web UI, examples) is never used, and its
+# deepest paths pass Windows' 260 characters unless long paths are enabled.
+CONVERTER_SOURCE = (
+    "convert_hf_to_gguf.py",
+    "convert_lora_to_gguf.py",
+    "conversion/",
+    "gguf-py/",
+    "models/templates/",
+)
+
+
 @dataclass(frozen=True)
 class Download:
     url: str
     sha256: str
     filename: str
+    # What to extract, as paths below the archive's top folder ("dir/" for a
+    # whole folder); None extracts everything.
+    keep: tuple[str, ...] | None = None
 
 
 @dataclass(frozen=True)
@@ -123,12 +139,26 @@ def _target(root, name):
     return target
 
 
-def extract(archive, root):
-    """Extract only regular files/dirs and internal links, never device nodes."""
+def _kept(name, keep):
+    if keep is None:
+        return True
+    # GitHub's source archives hold one top folder, named after the commit.
+    inner = name.split("/", 1)[1] if "/" in name else ""
+    return any(
+        inner == path or (path.endswith("/") and inner.startswith(path))
+        for path in keep
+    )
+
+
+def extract(archive, root, keep=None):
+    """Extract only regular files/dirs and internal links, never device nodes.
+    keep: as Download.keep; other entries are never written."""
     root.mkdir(parents=True, exist_ok=True)
     if zipfile.is_zipfile(archive):
         with zipfile.ZipFile(archive) as source:
             for item in source.infolist():
+                if not _kept(item.filename, keep):
+                    continue
                 target = _target(root, item.filename)
                 if stat.S_ISLNK(item.external_attr >> 16):
                     raise ValueError("ZIP symlinks are not allowed")
@@ -142,6 +172,8 @@ def extract(archive, root):
     with tarfile.open(archive) as source:
         links = []
         for item in source.getmembers():
+            if not _kept(item.name, keep):
+                continue
             target = _target(root, item.name)
             if item.isdir():
                 target.mkdir(parents=True, exist_ok=True)
@@ -190,6 +222,7 @@ def fetch(platform, *, machine=None, transport=None, manifest=None):
                 f"https://codeload.github.com/ggml-org/llama.cpp/tar.gz/{COMMIT}",
                 SOURCE_SHA256,
                 "source.tar.gz",
+                CONVERTER_SOURCE,
             ),
             Download(
                 f"https://github.com/ggml-org/llama.cpp/releases/download/{RELEASE}/{filename}",
@@ -216,8 +249,8 @@ def fetch(platform, *, machine=None, transport=None, manifest=None):
             return _tools(installed, name)
     staging = Path(tempfile.mkdtemp(prefix=".install-", dir=cache))
     try:
-        for archive in archives:
-            extract(archive, staging)
+        for item, archive in zip(manifest, archives, strict=True):
+            extract(archive, staging, item.keep)
         tools = _tools(staging, name)
         tools.quantize.chmod(tools.quantize.stat().st_mode | stat.S_IXUSR)
         checks = {

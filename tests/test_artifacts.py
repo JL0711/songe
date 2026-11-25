@@ -11,8 +11,16 @@ import httpx
 import pytest
 
 from songe.artifacts import export, merge
+from songe.artifacts import tools as tools_module
 from songe.artifacts.runtime import RunPolicy, guarded_run
-from songe.artifacts.tools import Download, Toolchain, download, extract, fetch
+from songe.artifacts.tools import (
+    CONVERTER_SOURCE,
+    Download,
+    Toolchain,
+    download,
+    extract,
+    fetch,
+)
 from songe.models import ModelRef
 from tests.crossplatform_helpers import (
     fake_platform,
@@ -100,6 +108,71 @@ def test_zip_and_tar_external_links_rejected(tmp_path):
         source.addfile(info)
     with pytest.raises(ValueError, match="Unsafe"):
         extract(archive, tmp_path / "extract")
+
+
+def test_source_archive_installs_only_what_the_converters_use(tmp_path):
+    # llama.cpp's web UI alone has 220-character paths: below a Windows data
+    # folder they pass 260, so without long paths the install always failed.
+    top = "llama.cpp-" + "c" * 40
+    source = archive_bytes(
+        {
+            f"{top}/convert_hf_to_gguf.py": b"hf",
+            f"{top}/convert_lora_to_gguf.py": b"lora",
+            f"{top}/conversion/__init__.py": b"conversion",
+            f"{top}/gguf-py/gguf/__init__.py": b"gguf",
+            f"{top}/models/templates/chat.jinja": b"template",
+            f"{top}/models/ggml-vocab-llama.gguf": b"unused",
+            f"{top}/examples/llama.android/README.md": b"unused",
+            f"{top}/tools/ui/src/lib/components/{'d' * 120}.svelte": b"unused",
+        }
+    )
+    binaries = archive_bytes({"build/bin/llama-quantize": b"binary"})
+    blobs = {"https://official.test/source": source, "https://official.test/bin": binaries}
+    transport = httpx.MockTransport(
+        lambda request: httpx.Response(200, content=blobs[str(request.url)])
+    )
+    manifest = [
+        Download(
+            "https://official.test/source",
+            hashlib.sha256(source).hexdigest(),
+            "source.tar.gz",
+            CONVERTER_SOURCE,
+        ),
+        Download(
+            "https://official.test/bin", hashlib.sha256(binaries).hexdigest(), "bin.tar.gz"
+        ),
+    ]
+    tools = fetch(
+        fake_platform(tmp_path), manifest=manifest, transport=transport, machine="x86_64"
+    )
+    installed = tools.source.parent
+    assert sorted(
+        p.relative_to(installed).as_posix() for p in installed.rglob("*") if p.is_file()
+    ) == [
+        "build/bin/llama-quantize",
+        "checksums.json",
+        f"{top}/conversion/__init__.py",
+        f"{top}/convert_hf_to_gguf.py",
+        f"{top}/convert_lora_to_gguf.py",
+        f"{top}/gguf-py/gguf/__init__.py",
+        f"{top}/models/templates/chat.jinja",
+    ]
+
+
+def test_pinned_source_archive_is_installed_for_the_converters_only(
+    tmp_path, monkeypatch
+):
+    requested = []
+
+    def recorded(item, directory, *, transport=None):
+        requested.append(item)
+        raise RuntimeError("no network in tests")
+
+    monkeypatch.setattr(tools_module, "download", recorded)
+    with pytest.raises(RuntimeError):
+        fetch(fake_platform(tmp_path, "win32"), machine="AMD64")
+    assert requested[0].filename == "source.tar.gz"
+    assert requested[0].keep == CONVERTER_SOURCE
 
 
 def test_memory_guard_success_failure_timeout_and_pressure(tmp_path):
