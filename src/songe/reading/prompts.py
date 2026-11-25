@@ -436,6 +436,41 @@ Is this one wish of the user, noted twice? First say each note again in your own
 - "different": they ask for two things (two tools, two foods, two things to leave out, two formats), or for opposite things.
 Answer with JSON only."""
 
+# Added to the lesson question when the feedback is a tool's own output. What
+# the output named is the lesson, as with the user's words. Live (Qwen3.5-4B
+# and 9B, 30 coding tasks with failing commands): "pytest: command not found"
+# and "No module named pytest" were stored as "Install missing dependencies
+# before running tests." and the next task ran the same failing command
+# (issue #144).
+# What the agent did next is added only when it is the ordinary way to do the
+# thing. Live (the same sessions, read three times): pip's refusal to install
+# into the system Python became "Use '--break-system-packages' when pip
+# refuses to install." each time, once as the only note in the prompt.
+# How far the fact reaches is judged by the lesson question's own rule. Live,
+# with a line here that made a fact about the tool or the machine "always": 13
+# to 16 of 16 to 19 lessons were read as "always" (8 of 18 without it), among
+# them "Install missing dependencies like tomli_w before running tests.",
+# which is true of one project.
+TOOL_FACT = """
+The feedback is a tool's own output. If it shows how the tool or this machine behaves (a command, program, module or option that is missing or refused, a value the tool does not accept, the form it wants), that fact is the lesson, and the rule below about naming the general practice does not apply:
+  - lesson and short state the fact and name exactly what the output named (the command, program, module, option, value or message), written out as in the output. Never replace it with its category ("the missing dependency", "the right tool", "the required format"). Here short may be a statement instead of an instruction.
+  - Add what to do instead only if the agent then did it, it worked, and it is the ordinary way to do the thing. A way around a refusal or a warning that protects something (forcing, overriding or skipping a check, installing for the whole system, switching the protection off) is never part of the lesson, even when it worked: then the lesson is the fact alone.
+    Shapes, where <NAME> stands for what the output named and <WORKED> for the ordinary thing that worked afterwards:
+    "<NAME>: command not found" -> "<NAME> is not installed here; use <WORKED>." or, with nothing ordinary that worked, "<NAME> is not installed here."
+    "<NAME> is not accepted" -> "<NAME> is not accepted; use <WORKED>."
+  This task's own files, function names and data still do not belong in the lesson."""
+
+# Asked instead when the failed result is the last thing in the conversation:
+# the agent stopped there, so the task was not completed (a lost game, a build
+# that never passed). The steps in between each looked reasonable; the lesson
+# is in the whole attempt, not in the last message (live: lost word games gave
+# "When the turn limit is reached, acknowledge the revealed secret word").
+ENDED = """
+The feedback is a tool's own output, and the conversation ended with it: the task was not completed. All steps of the attempt, one line each:
+{attempt}
+Write the lesson about the attempt as a whole: what the agent should do differently from the start of the next task of this kind (its approach, what it should check or rule out first, what it kept doing that did not help). The lesson is not about the last step, nor about how to react to this final message or how to report the ending.
+If the output names something that is missing or refused (a command, program, module, option or value), the lesson names it exactly as written."""
+
 # The prompt's own example lessons: a lesson that repeats one of them was
 # copied, not written (live: Granite 3B on LM Studio gave all 9 signals the
 # renaming example as their lesson).
@@ -455,7 +490,7 @@ def copied_example(lesson):
     text = " ".join(str(lesson or "").lower().split())
     if not text:
         return False
-    if "<thing>" in text or "<other>" in text:
-        return True  # a shape of USER_WISH with its placeholders left in
+    if any(mark in text for mark in ("<thing>", "<other>", "<name>", "<worked>")):
+        return True  # a shape of USER_WISH or TOOL_FACT with its placeholders left in
     return any(difflib.SequenceMatcher(None, text, " ".join(e.lower().split())).ratio() > 0.8
                or text.startswith(" ".join(e.lower().split())[:50]) for e in EXAMPLE_LESSONS)
