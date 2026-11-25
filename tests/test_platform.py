@@ -324,3 +324,15 @@ def test_a_later_gguf_learner_gets_the_converter_runtime_once(tmp_path, monkeypa
     # CUDA/ROCm runtimes already carry torch; nothing is installed there.
     cuda = SimpleNamespace(accelerators=lambda: [SimpleNamespace(kind="cuda")])
     assert install.converter_python(Rooted(cuda, tmp_path)) == sys.executable
+
+
+def test_a_real_conversion_asks_for_the_converter_runtime(monkeypatch):
+    # The runner conversion and merges use by default is the artifacts one;
+    # matched against memory.guarded_run, the converter runtime above was
+    # never provisioned and a Mac without torch failed every retry.
+    from songe.artifacts.runtime import guarded_run
+    from songe.backends import install
+
+    monkeypatch.setattr(install, "converter_python", lambda platform: "converter")
+    assert install.interpreter_for(object(), guarded_run) == "converter"
+    assert install.interpreter_for(object(), lambda *a, **k: None) == sys.executable

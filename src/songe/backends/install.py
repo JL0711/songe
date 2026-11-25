@@ -268,6 +268,8 @@ def converter_python(platform):
 
 def interpreter_for(platform, runner):
     """A real run provisions the converter; an injected runner never installs."""
-    from ..memory import guarded_run
+    # The runner conversion and merges are given by default (memory's own
+    # guarded_run sits underneath it and is never passed here).
+    from ..artifacts.runtime import guarded_run
 
     return converter_python(platform) if runner is guarded_run else sys.executable
