@@ -1026,6 +1026,96 @@ def test_models_resolve_by_the_name_songe_models_shows(config, store):
     assert registry.find(store, "Qwen3.5-0.8B") is None  # ambiguous
 
 
+def pulling_ollama(config, store, monkeypatch, pulled):
+    """Songe in front of an Ollama that serves what is in `pulled`."""
+    from songe import memory
+
+    monkeypatch.setattr(
+        memory, "guarded_run", lambda *a, **kw: SimpleNamespace(returncode=0)
+    )
+    config.upstream, config.upstream_url = "ollama", "http://127.0.0.1:11434/v1"
+    seen = []
+
+    def handle(request):
+        if request.url.path == "/v1/models":
+            return httpx.Response(200, json={"data": [{"id": m} for m in pulled]})
+        model = json.loads(request.content)["model"]
+        seen.append(model)
+        if model not in pulled:
+            status, body = 404, {"error": {"message": f'model "{model}" not found'}}
+        else:
+            message = {"role": "assistant", "content": "ok"}
+            status, body = 200, {"model": model, "choices": [{"message": message}]}
+        return httpx.Response(status, stream=Chunks([json.dumps(body).encode()]))
+
+    wire = httpx.AsyncClient(transport=httpx.MockTransport(handle))
+    return create_app(config, store, client=wire), wire, seen
+
+
+async def test_a_model_pulled_while_songe_runs_answers_to_its_songe_name(
+    config, store, monkeypatch
+):
+    """Live run (Windows, Ollama): qwen3:1.7b, pulled while Songe ran, was
+    asked for as songe/qwen3-1.7b: "not found", that name stayed as a model
+    of its own, and qwen3:1.7b became songe/qwen3-1.7b-1306f749."""
+    from songe.models.names import catalog
+
+    pulled = [config.base_identifier]
+    app, wire, seen = pulling_ollama(config, store, monkeypatch, pulled)
+    async with app.router.lifespan_context(app):
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app), base_url="http://localhost"
+        ) as client:
+            pulled.append("qwen3:1.7b")
+            for model in ("songe/qwen3-1.7b", "qwen3:1.7b"):
+                response = await client.post(
+                    "/v1/chat/completions", json={"model": model, "messages": []}
+                )
+                assert response.status_code == 200
+                assert response.json()["model"] == model
+    await wire.aclose()
+    assert seen == ["qwen3:1.7b", "qwen3:1.7b"]
+    assert [r["id"] for r in registry.entries(store)] == [
+        config.base_identifier,
+        "qwen3:1.7b",
+    ]
+    assert catalog(config, store)["qwen3:1.7b"] == "songe/qwen3-1.7b"
+
+
+async def test_a_songe_name_of_no_model_is_passed_on_and_not_kept(
+    config, store, monkeypatch
+):
+    # Asked for before the pull: the agent gets the server's "not found",
+    # and the name stays free for the model that is pulled later.
+    from songe.models.names import catalog
+
+    store.add_version(version("night-1", 1))
+    store.swap("night-1", None)
+    pulled = [config.base_identifier]
+    app, wire, seen = pulling_ollama(config, store, monkeypatch, pulled)
+    async with app.router.lifespan_context(app):
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app), base_url="http://localhost"
+        ) as client:
+
+            async def ask():
+                return await client.post(
+                    "/v1/chat/completions",
+                    json={"model": "songe/qwen3-1.7b", "messages": []},
+                )
+
+            assert (await ask()).status_code == 404
+            assert [r["id"] for r in registry.entries(store)] == [
+                config.base_identifier
+            ]
+            pulled.append("qwen3:1.7b")
+            assert (await ask()).status_code == 200
+    await wire.aclose()
+    # Passed on as asked, not answered by the installation's own model.
+    assert seen == ["songe/qwen3-1.7b", "qwen3:1.7b"]
+    assert catalog(config, store)["qwen3:1.7b"] == "songe/qwen3-1.7b"
+
+
 def test_dream_calls_go_where_the_proxy_sends_the_version(config, store):
     # #27: reading, review and Quick Dream examples used upstream_url, the
     # Songe-owned server, which runs only while Songe needs it.

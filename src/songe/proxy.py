@@ -259,7 +259,7 @@ def create_app(config=None, store=None, client=None, scheduler=None):
     from .models import registry
 
     registry.migrate(config, store)
-    from .models.names import catalog
+    from .models.names import catalog, public_name
 
     cached_version = store.version()
     owns_client = client is None
@@ -396,6 +396,20 @@ def create_app(config=None, store=None, client=None, scheduler=None):
             if scheduler:
                 scheduler.release("admission")
 
+    async def served_models():
+        """The ids the user's own server lists now; none if it cannot say."""
+        url = (config.server_source_url or config.upstream_url).rstrip("/")
+        try:
+            response = await client.get(url + "/models")
+            response.raise_for_status()
+            return [
+                m["id"]
+                for m in response.json()["data"]
+                if isinstance(m.get("id"), str)
+            ]
+        except (httpx.HTTPError, ValueError, KeyError, TypeError, AttributeError):
+            return []
+
     async def relay(request: Request):
         nonlocal cached_version
         started = time.time()
@@ -429,6 +443,17 @@ def create_app(config=None, store=None, client=None, scheduler=None):
                     (raw for raw, alias in aliases.items() if alias == requested), None
                 )
                 model = model or (store.get("primary_model") if is_alias else requested)
+                if not is_alias and requested.startswith("songe/"):
+                    # A name Songe has not given out yet (a model pulled since
+                    # it started): the server's own list says which model it
+                    # names. A name no model there has is passed on as asked;
+                    # kept as a model, it would push the real one onto another
+                    # name once that is pulled.
+                    model = next(
+                        (m for m in await served_models() if public_name(m) == requested),
+                        None,
+                    )
+                    is_alias, version = model is not None, None
                 if model:
                     row = await asyncio.to_thread(
                         registry.observe, config, store, model
