@@ -1848,13 +1848,18 @@ class ModelScheduler(Scheduler):
         """Throw away this model's Dream under way: stop its training child,
         discard its night (running, interrupted or waiting to swap). Its
         practice stays untrained, so a later Deep Dream trains it. Returns how
-        many nights were discarded."""
+        many nights were discarded; self.cancel_stopped says whether work
+        under way (a reading, a measurement, a pressed Dream getting ready)
+        was stopped, self.cancel_requested whether a pressed Dream was."""
         async with self.lock:
+            stopped = False
             for name in ("dream_task", "reading_task"):
                 task = getattr(self, name, None)
                 if task is not None and not task.done():
                     task.cancel()
+                    stopped = True
             if self.process and self.active_model == model:
+                stopped = True
                 self.interrupt("cancelled")
                 try:
                     await asyncio.wait_for(
@@ -1870,11 +1875,16 @@ class ModelScheduler(Scheduler):
                 if night["status"] in {"running", "interrupted", "ready", "waiting"}:
                     learner.night(night["id"], status="discarded")
                     discarded += 1
-            if self.installation_store.get("requested_model") == model:
+            requested = self.installation_store.get("requested_model") == model
+            if requested:
+                # A pressed Dream still getting ready: it is stopped too.
+                stopped = True
                 self.installation_store.set("requested_model", None)
                 self.installation_store.set("requested_sleep", False)
             learner.set("memory_wait", None)  # a cancelled Dream waits for nothing
             learner.set("dream_memory_waits", None)
+            self.cancel_stopped = stopped
+            self.cancel_requested = requested
             return discarded
 
     @staticmethod
