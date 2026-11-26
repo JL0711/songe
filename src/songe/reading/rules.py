@@ -190,7 +190,12 @@ LASTING = re.compile(
 # Words that point back at the conversation ("whatever that was"): such a
 # sentence means nothing in a later task.
 DEICTIC = re.compile(
-    r"\b(whatever|that was|like that|it again|that again|do that|do this|this one|that one|those ones)\b", re.I
+    r"\b(whatever|that was|like that|it again|that again|do that|do this|this one|that one|those ones)\b"
+    # Ending on what it points at: "always start your reply with that" names
+    # the thing in the sentence before it (#266). After a comma the thing is
+    # in the same sentence ("Never use semicolons, I hate those."): a rule.
+    r"|^[^,;]*\b(that|this|those|these)\W*$",
+    re.I,
 )
 SENTENCES = re.compile(r"(?<=[.!?])\s+")
 
