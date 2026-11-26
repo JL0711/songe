@@ -2534,3 +2534,52 @@ def test_the_same_wish_said_again_retires_nothing(config, store):
     assert reader.checked == [(first, again)]
     texts = {quick.wording(s)[0] for s in reading.signals(store) if s["type"] == "correction" and s.get("lesson")}
     assert {first, again} <= texts
+
+
+def test_a_command_written_as_a_list_is_read_as_its_command_line(store):
+    """Live (qwen3:1.7b on Ollama, Windows, an agent with a run_command tool):
+    the model wrote the command as a list five times ({"command": ["pip",
+    "install", "rich"]}), and reading raised on it (TypeError). The words are
+    the command line they make; arguments that are not a JSON object name no
+    command."""
+    from songe.reading import views
+    from songe.reading.rules import command_of
+
+    tools = [tool("run_command", command="string")]
+    history = [SYSTEM, {"role": "user", "content": "Install rich and show me what is here."}]
+    for action, result in (tool_step("a", "run_command", "Successfully installed rich-13.7.1",
+                                     command=["pip", "install", "rich"]),
+                           tool_step("b", "run_command", "README.md\nsrc", command=["ls", "-la"])):
+        store.record("/v1/chat/completions", {"messages": history, "tools": tools}, reply(action))
+        history = history + [action, result]
+    store.record("/v1/chat/completions", {"messages": history, "tools": tools},
+                 reply({"role": "assistant", "content": "Done."}))
+    store.reconstruct()
+
+    class Reviewing(FakeReader):
+        def __init__(self):
+            super().__init__()
+            self.reviews = []
+
+        async def ask(self, prompt, schema, name):
+            if name == "review":
+                self.reviews.append(prompt)
+            return await super().ask(prompt, schema, name)
+
+    reader = Reviewing()
+    assert read(store, reader) == 1
+    # Installing is work to review; listing only looks around.
+    (question,) = reader.reviews
+    assert "Successfully installed rich" in question and "README.md" not in question
+
+    def looks_around(arguments):
+        items = [{"kind": "action", "step": 1, "text": "",
+                  "tool_calls": [{"id": "x", "name": "run_command", "arguments": arguments}]},
+                 {"kind": "tool_result", "call": "x", "step": 1, "tool": "run_command", "content": ""}]
+        return views.inspecting(items, 1)
+
+    assert looks_around(json.dumps({"command": ["cd", "src", "&&", "git", "status"]}))
+    assert not looks_around(json.dumps({"command": ["pip", "install", "rich"]}))
+    assert not any(looks_around(a) for a in ('["ls", "-la"]', '"ls -la"'))
+    assert command_of({"arguments": json.dumps({"command": ["cargo", "test"]})}) == "cargo test"
+    assert command_of({"arguments": '["cargo", "test"]'}) == ""
