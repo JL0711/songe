@@ -325,6 +325,41 @@ def test_a_prefix_that_cannot_be_frozen_leaves_the_window(backend, step, monkeyp
     assert len(prefixes) == 1  # not read again for nothing
 
 
+def test_offloaded_activations_leave_the_checkpointed_head_chunks_alone(
+    backend, step, monkeypatch
+):
+    # With activations offloaded (by default when the base is in 4-bit on
+    # CUDA) every training step failed with CheckpointError, and #235 passed
+    # each sample over: a whole Deep Dream learned nothing. The head runs in
+    # checkpointed chunks, slices of the last hidden states, and a checkpoint
+    # saves its inputs with the hooks around it: offloaded, a slice comes back
+    # as a fresh copy, with other strides. torch 2.11's linear then takes
+    # another kernel when the head runs again and saves tensors of other
+    # shapes. Newer torch reads both alike, so the head here picks its kernel
+    # as torch 2.11 does.
+    head = backend._causal().get_output_embeddings()
+
+    def linear_as_torch_2_11(hidden):
+        # One mm when the rows read as a matrix in place, else a bmm over the
+        # weight broadcast to [1, d, v], which is saved as such.
+        weight = head.weight.t()
+        batch, rows, width = hidden.shape
+        if hidden.stride(0) == hidden.stride(1) * rows:
+            return (hidden.reshape(-1, width) @ weight).reshape(batch, rows, -1)
+        return torch.bmm(hidden, weight.expand(batch, *weight.shape))
+
+    monkeypatch.setattr(head, "forward", linear_as_torch_2_11)
+    y = [7, 8, 9]  # token_chunk 2: two chunks, each a slice of the three rows
+    monkeypatch.setattr(backend, "sample", lambda *args, **kwargs: (y, "", None))
+    plain, plain_grads, _ = backend.train_step(step, seed=8)
+    monkeypatch.setattr(backend.options, "offload_activations", "on")
+    offloaded, grads, _ = backend.train_step(step, seed=8)
+    assert offloaded == pytest.approx(plain, rel=1e-5, abs=1e-7)
+    assert grads.keys() == plain_grads.keys()
+    for name, grad in grads.items():
+        torch.testing.assert_close(grad, plain_grads[name], rtol=1e-4, atol=1e-7)
+
+
 def test_lora_scale_follows_alpha_over_rank(backend):
     scales = {
         module.scaling["default"]
