@@ -976,22 +976,27 @@ class TorchBackend:
         )
         with contextlib.ExitStack() as stack:
             stack.callback(self.model.eval)
-            stack.enter_context(saving)
             # Entered for the backward pass too: it runs the layers again.
             if not stack.enter_context(keeping):
                 # Remembered, so later steps do not read a prefix for nothing.
                 self._window_only, past = True, None
             inputs = self.torch.tensor([tail + y[:-1]], device=self.device)
-            hidden = (
-                self._causal()
-                .base_model(
-                    input_ids=inputs,
-                    past_key_values=past,
-                    use_cache=past is not None,
-                    return_dict=True,
+            # Only the layers' activations go to host RAM. The head's chunks
+            # below are checkpointed, and a checkpoint saves its inputs with
+            # the hooks around it: offloaded, a chunk (a slice) came back as a
+            # fresh copy, linear took another kernel when the head ran again
+            # (torch 2.11: mm, not bmm) and every step failed (CheckpointError).
+            with saving:
+                hidden = (
+                    self._causal()
+                    .base_model(
+                        input_ids=inputs,
+                        past_key_values=past,
+                        use_cache=past is not None,
+                        return_dict=True,
+                    )
+                    .last_hidden_state[:, response_positions(tail, y)]
                 )
-                .last_hidden_state[:, response_positions(tail, y)]
-            )
             total = hidden.new_zeros((), dtype=self.torch.float32)
 
             def head_loss(student_h, teacher_h):
